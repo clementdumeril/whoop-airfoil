@@ -219,14 +219,15 @@ class Controller:
 # ----------------------------------------------------------------------------------------------------
 # Simulation (noise-free truth) and sensor model
 # ----------------------------------------------------------------------------------------------------
-def simulate(P, sched):
+def simulate(P, sched, ctrl_gains=None):
+    """ctrl_gains: keyword arguments of Controller (gains) instead of its defaults"""
     t = sched["t"]
     n = len(t)
     x = np.zeros(13)
     x[0:3] = sched["p"][0]
     x[6] = 1.0
     u_m = np.full(4, M.hover_command(P))
-    ctrl = Controller(P)
+    ctrl = Controller(P, **(ctrl_gains or {}))
     nl = (n + LOG_EVERY - 1) // LOG_EVERY
     L = dict(t=np.zeros(nl), x=np.zeros((nl, 13)), u_cmd=np.zeros((nl, 4)), u_m=np.zeros((nl, 4)),
              sf=np.zeros((nl, 3)), seg=np.zeros(nl, int))
@@ -246,17 +247,34 @@ def simulate(P, sched):
     return L
 
 
-def truth_flight(kind, duration, plate, seed, body_drag=M.TRUE_BODY_DRAG):
-    """Noise-free truth log, cached as npz under CACHE."""
+def truth_flight(kind, duration, plate, seed, body_drag=M.TRUE_BODY_DRAG, params=None, gains=None):
+    """Noise-free truth log, cached as npz under CACHE.
+
+    params: another parameter file in the format of params/whoop_nominal.json to simulate instead of the nominal
+    whoop (a "true" drone for the sim-to-sim test of sysid/export_params.py). Its own body_drag is then the truth, and
+    the cache file name carries the file's stem so that the nominal cache is never reused for it.
+    gains: attitude gains of the controller, dict(kR=(...), kw=(...)), instead of its defaults (kR 120, 120, 60 and
+    kw 16, 16, 12); they go into the cache name. The controller only flies the manoeuvres (the identification never
+    sees it); a drone with a stronger plate and slower motors needs stiffer attitude control in the sideways climbs,
+    where the plate moment is largest.
+    """
     CACHE.mkdir(parents=True, exist_ok=True)
-    fn = CACHE / f"truth_{kind}_{int(duration)}s_plate{int(plate)}_seed{seed}.npz"
+    tag = "" if params is None else "_" + Path(params).stem
+    if gains is not None:
+        tag += "".join(f"_{k}" + "-".join(f"{g:g}" for g in v) for k, v in sorted(gains.items()))
+    fn = CACHE / f"truth{tag}_{kind}_{int(duration)}s_plate{int(plate)}_seed{seed}.npz"
     if fn.exists():
         d = np.load(fn)
         return {k: d[k] for k in d.files}
-    P = M.load_params(plate=plate, body_drag=body_drag)
+    if params is None:
+        P = M.load_params(plate=plate, body_drag=body_drag)
+    else:
+        import json
+        drag = json.loads(Path(params).read_text())["whoop"]["body_drag"]
+        P = M.load_params(params, plate=plate, body_drag=drag)
     rng = np.random.default_rng(seed)
     sched = (excitation_schedule if kind == "excitation" else plate_schedule)(duration, P, rng)
-    L = simulate(P, sched)
+    L = simulate(P, sched, gains)
     np.savez_compressed(fn, **L)
     return L
 

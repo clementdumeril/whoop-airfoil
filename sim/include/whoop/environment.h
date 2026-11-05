@@ -36,6 +36,17 @@ namespace whoop{
     //                         + angular_velocity |omega|^2 + action |a - a_hover|^2),  termination_penalty if terminated
     // evaluated on the state before the step, as in L2F. a_hover is the hover command in the normalized action [-1, 1]
     // (0.334 for the Crazyflie in L2F), taken from the dynamics so that it follows the mass of each variant.
+    //
+    // Two options added for the whoop (both off by default, so the reward is the paper's):
+    //   thrust      weight of a rotor power cost, + thrust * (mean_i (f_i / f_hover)^1.5 - 1) inside the bracket, with
+    //               f_i the thrust that rotor i is commanded to give and f_hover = m g / 4. Momentum theory puts the
+    //               induced power of a rotor at f^1.5, so this is the power relative to hover, minus 1 so that hovering
+    //               costs nothing and the reward of a perfect flight stays at the constant (no new incentive to end an
+    //               episode early). It is what makes a plate that carries weight pay off [assumption: the commanded
+    //               thrust, not the lagged rotor state, so that the cost is recomputed from the stored action]
+    //   tilt_only   the orientation cost on the tilt alone, q_x^2 + q_y^2 = (1 - R_zz) / 2, instead of 1 - q_w^2, which
+    //               also charges any yaw away from world x: with it the policy may choose its heading relative to the
+    //               path (the plate is face-on or edge-on to the air depending on that heading)
     template <typename T>
     struct Reward{
         T scale;
@@ -46,6 +57,15 @@ namespace whoop{
         T linear_velocity;
         T angular_velocity;
         T action;
+        T thrust;
+        bool tilt_only;
+    };
+
+    // what the power cost needs from the dynamics: the thrust curve and the hover thrust per rotor
+    template <typename T>
+    struct RotorPower{
+        T thrust_coefficients[3];  // c0 + c1 u + c2 u^2 [N], the same for the four rotors
+        T hover_thrust;            // m g / 4 [N]
     };
 
     template <typename T>
@@ -174,6 +194,8 @@ namespace whoop{
         0.01,  // linear velocity
         0.0,   // angular velocity
         0.01,  // action
+        0.0,   // thrust (power cost, off)
+        false, // tilt_only (off: the paper's 1 - q_w^2)
     };
     template <typename T>
     struct Curriculum{

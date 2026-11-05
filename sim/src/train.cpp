@@ -29,9 +29,28 @@
 //   until --duration (default 5 s, at most the 5 s episode). Nominal aerodynamics; the N seeds (default 5) change the
 //   random force and torque and the sensor noise. out_dir gets config.json, flights.csv (the format of training plus
 //   a motors_cut column) and scenario.json (altitude lost and recovery, per seed)
+//
+// Options for every mode (they change the parameters every environment of the run starts from):
+//   --params FILE     the whoop and plate parameters from a JSON in the format of params/whoop_nominal.json instead of
+//                     the compiled ones (to train on identified parameters, or to fly a policy on a "true" drone)
+//   --plate-z Z       the plate centroid height relative to the centre of mass [m] (nominal -0.04); the inertia follows
+//   --thrust-cost W   a rotor power cost of weight W in the reward (whoop::Reward::thrust, environment.h)
+//   --free-yaw        the orientation cost on the tilt only, so that the policy may choose its heading to the path
+//   --speed-min V, --speed-max V   the speed range of the velocity task (default 1-4 m/s)
+//
+// whoop_train_<sac|td3>_velocity_<noplate|plate> <out_dir> --evaluate <actor.tar> [options above]
+//   no training: the test flights of training (evaluation.json, flights.csv) and the speed sweep (sweep_flights.csv)
+//   with a trained actor, on the parameters given by the options (for example a policy trained on identified
+//   parameters, flown on the true drone)
+//
+// Every evaluation also flies a speed sweep: level starts at rest, references at 2, 2.5, 3, 3.5 and 4 m/s in 8
+// headings, no random force; evaluation.json gives per speed the mean rotor thrust and plate lift over t = 2-5 s, the
+// angle between body x and the path, the roll and the plate angle of attack
 #include <rl_tools/operations/cpu_mux.h>
 
 #include <whoop/operations.h>
+#include <whoop/params_runtime.h>
+#include <whoop/metrics.h>
 
 #include <rl_tools/nn/optimizers/adam/instance/operations_generic.h>
 #include <rl_tools/nn/operations_cpu_mux.h>
@@ -100,6 +119,16 @@ using TI = typename DEVICE::index_t;
 constexpr whoop::Task TASK = WHOOP_TASK_VELOCITY ? whoop::Task::VELOCITY : whoop::Task::HOVER;
 using FACTORY = whoop::EnvironmentFactory<T, TI, WHOOP_PLATE, TASK>;
 using ENVIRONMENT = FACTORY::ENVIRONMENT;
+
+// the parameters every environment of this run starts from: the compiled nominal ones, changed once in run() by the
+// command-line options (--params, --plate-z, --thrust-cost, --free-yaw, --speed-min, --speed-max) before anything is
+// sampled. Without those options this is exactly FACTORY::nominal_parameters, so the default runs are unchanged
+ENVIRONMENT::Parameters base_parameters = FACTORY::nominal_parameters;
+
+void init_environment(DEVICE& device, ENVIRONMENT& env){
+    rlt::init(device, env);
+    env.parameters = base_parameters;
+}
 
 // RLtools stops training silently past STEP_LIMIT: keep it above any step count passed on the command line
 constexpr TI STEP_LIMIT_MAX = 10000001;
@@ -204,6 +233,8 @@ void apply_reward(DEVICE& device, RUNNER& runner, const whoop::Reward<T>& reward
     env.parameters.mdp.reward = reward;
     parameters.mdp.reward = reward;
     T baseline = whoop::action_baseline(env.parameters.dynamics.hovering_throttle_relative);
+    // the thrust curve and mass are not randomized, so one power model holds for every stored transition
+    auto power = whoop::rotor_power_model(env.parameters.dynamics);
     auto& rb = rlt::get(runner.replay_buffers, 0, 0);
     constexpr TI N = ENVIRONMENT::ObservationPrivileged::DIM;
     T o[N], a[ENVIRONMENT::ACTION_DIM];
@@ -211,7 +242,7 @@ void apply_reward(DEVICE& device, RUNNER& runner, const whoop::Reward<T>& reward
         for(TI j = 0; j < N; j++) o[j] = rlt::get(rb.observations_privileged, i, j);
         for(TI j = 0; j < ENVIRONMENT::ACTION_DIM; j++) a[j] = rlt::get(rb.actions, i, j);
         bool terminated = rlt::get(rb.terminated, i, 0) > T(0.5);
-        rlt::set(rb.rewards, i, 0, whoop::reward_from_privileged_observation(reward, o, a, baseline, terminated));
+        rlt::set(rb.rewards, i, 0, whoop::reward_from_privileged_observation(reward, o, a, baseline, power, terminated));
     }
 }
 
@@ -282,7 +313,8 @@ std::string runner_checks(const RUNNER& runner){
         }
     }
     double tilted_fraction = starts > 0 ? double(tilted) / starts : 0;
-    bool ok = tilted_fraction > 0.1 && (!WHOOP_TASK_VELOCITY || (max_reference_speed > 2 && max_reference_speed < 4.01 && max_reference_vz < 1e-3));
+    const double speed_max = base_parameters.velocity_task.speed_max;
+    bool ok = tilted_fraction > 0.1 && (!WHOOP_TASK_VELOCITY || (max_reference_speed > 2 && max_reference_speed < speed_max + 0.01 && max_reference_vz < 1e-3));
     std::ostringstream json;
     json << "{\n  \"episode_starts\": " << starts << ",\n  \"starts_tilted_above_57_deg\": " << tilted_fraction
          << ",\n  \"max_reference_speed\": " << max_reference_speed << ",\n  \"max_reference_vertical_speed\": " << max_reference_vz
@@ -310,7 +342,7 @@ TestSet test_set(DEVICE& device, TI seed, bool randomization){
     set.parameters.resize(N_TESTS);
     set.starts.resize(N_TESTS);
     ENVIRONMENT env;
-    rlt::init(device, env);
+    init_environment(device, env);
     env.parameters.randomization.enabled = randomization;
     env.parameters.motor_cut.probability = 0;
     RNG rng;
@@ -327,9 +359,41 @@ TestSet test_set(DEVICE& device, TI seed, bool randomization){
 struct Summary{
     double success_rate = 0, position_rmse = 0, position_rmse_last_half = 0, velocity_rmse = 0, velocity_rmse_last_half = 0;
     double mean_return = 0, mean_length = 0, plate_force_to_weight = 0, max_plate_force_to_weight = 0, mean_action_change = 0;
+    // over every step flown (whoop/metrics.h): the world-z plate force and the total rotor thrust, over the weight
+    double plate_lift_to_weight = 0, rotor_thrust_to_weight = 0;
 };
 
 double norm3(const T* v){ return std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]); }
+
+const double DEG = 180 / 3.14159265358979323846;
+
+struct Angles{ double roll, pitch, yaw; };  // ZYX, degrees
+Angles euler_zyx(const T* q){
+    Angles a;
+    a.roll = std::atan2(2 * (q[0] * q[1] + q[2] * q[3]), 1 - 2 * (q[1] * q[1] + q[2] * q[2])) * DEG;
+    a.pitch = std::asin(std::clamp(2 * (q[0] * q[2] - q[3] * q[1]), T(-1), T(1))) * DEG;
+    a.yaw = std::atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3])) * DEG;
+    return a;
+}
+
+double wrap180(double a){
+    while(a > 180) a -= 360;
+    while(a <= -180) a += 360;
+    return a;
+}
+
+double yaw_to_path(const T* q, const T* reference_velocity){
+    // yaw of the body x axis relative to the direction of the reference velocity (the path), in (-180, 180] deg; 0 when
+    // the reference is at rest. 0 or 180: the plate edge-on to the path, +-90: face-on
+    double heading = std::atan2(double(reference_velocity[1]), double(reference_velocity[0])) * DEG;
+    return wrap180(euler_zyx(q).yaw - heading);
+}
+
+double crab_angle(double yaw_to_path_deg){
+    // the same folded into [0, 90] deg: the plate is symmetric front to back
+    double c = std::abs(wrap180(yaw_to_path_deg));
+    return c > 90 ? 180 - c : c;
+}
 
 // a template only so that the velocity-task branch is not compiled for hover
 template <typename PARAMETERS, typename STATE>
@@ -352,27 +416,28 @@ void desired_state(DEVICE& device, ENVIRONMENT& env, PARAMETERS& p, const STATE&
 }
 
 // flights.csv: one row per simulation step, the state after the step (the scenario adds a motors_cut column)
+// the plate force is in the body frame; plate_lift_to_weight, rotor_thrust_to_weight: whoop/metrics.h; yaw_to_path_deg:
+// body x relative to the reference velocity (0 when the reference is at rest)
 const char* FLIGHTS_HEADER = "flight,t,x,y,z,vx,vy,vz,roll_deg,pitch_deg,yaw_deg,reference_x,reference_y,reference_z,reference_vx,reference_vy,reference_vz,"
-                             "command_1,command_2,command_3,command_4,rotor_1,rotor_2,rotor_3,rotor_4,plate_fx,plate_fy,plate_fz,plate_alpha_deg,airspeed,terminated";
+                             "command_1,command_2,command_3,command_4,rotor_1,rotor_2,rotor_3,rotor_4,plate_fx,plate_fy,plate_fz,plate_alpha_deg,airspeed,terminated,"
+                             "plate_lift_to_weight,rotor_thrust_to_weight,yaw_to_path_deg";
 
 void write_flight_row(std::ostream& out, TI flight, double t, const ENVIRONMENT::State& next, const ENVIRONMENT::State& reference, const T command[4],
-                      const whoop::PlateAerodynamics<T>& aero, bool terminated){
+                      const whoop::FlightMetrics<T>& metrics, bool terminated){
     // command: the motor command in [0, 1] that was applied during the step
-    const T* q = next.orientation;
-    const double deg = 180 / 3.14159265358979323846;
-    double roll = std::atan2(2 * (q[0] * q[1] + q[2] * q[3]), 1 - 2 * (q[1] * q[1] + q[2] * q[2])) * deg;
-    double pitch = std::asin(std::clamp(2 * (q[0] * q[2] - q[3] * q[1]), T(-1), T(1))) * deg;
-    double yaw = std::atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3])) * deg;
+    Angles a = euler_zyx(next.orientation);
+    const auto& aero = metrics.aero;
     out << flight << "," << t;
     for(TI i = 0; i < 3; i++) out << "," << next.position[i];
     for(TI i = 0; i < 3; i++) out << "," << next.linear_velocity[i];
-    out << "," << roll << "," << pitch << "," << yaw;
+    out << "," << a.roll << "," << a.pitch << "," << a.yaw;
     for(TI i = 0; i < 3; i++) out << "," << reference.position[i];
     for(TI i = 0; i < 3; i++) out << "," << reference.linear_velocity[i];
     for(TI i = 0; i < 4; i++) out << "," << command[i];
     for(TI i = 0; i < 4; i++) out << "," << next.rpm[i];
     for(TI i = 0; i < 3; i++) out << "," << aero.force[i];
-    out << "," << aero.alpha * deg << "," << aero.airspeed << "," << terminated;
+    out << "," << aero.alpha * DEG << "," << aero.airspeed << "," << terminated << "," << metrics.plate_lift_to_weight << ","
+        << metrics.rotor_thrust_to_weight << "," << yaw_to_path(next.orientation, reference.linear_velocity);
 }
 
 template <typename ACTOR>
@@ -392,12 +457,13 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
     rlt::reset(device, actor, actor_state, rng);
 
     ENVIRONMENT env;
-    rlt::init(device, env);
+    init_environment(device, env);
     std::vector<ENVIRONMENT::State> states = tests.starts;
     std::vector<bool> done(N_TESTS, false), failed(N_TESTS, false);
     std::vector<double> returns(N_TESTS, 0), change(N_TESTS, 0);
     std::vector<std::vector<std::array<double, 2>>> errors(N_TESTS);  // position and velocity error per step
     double plate_force_sum = 0, plate_force_max = 0, plate_samples = 0;
+    double lift_sum = 0, thrust_sum = 0, samples = 0;
     std::vector<std::array<T, 4>> previous(N_TESTS);
     for(TI k = 0; k < N_TESTS; k++){
         for(TI i = 0; i < 4; i++) previous[k][i] = whoop::action_baseline(tests.parameters[k].dynamics.hovering_throttle_relative);
@@ -435,18 +501,20 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
             double c = 0;
             for(TI i = 0; i < 4; i++){ c += std::abs(rlt::get(action, 0, i) - previous[k][i]); previous[k][i] = rlt::get(action, 0, i); }
             change[k] += c / 4;
-            whoop::PlateAerodynamics<T> aero{};
+            whoop::FlightMetrics<T> metrics = whoop::flight_metrics(device, p, next);
             if(p.plate.area > 0){
-                whoop::plate_aerodynamics(device, p.plate, next.orientation, next.linear_velocity, next.angular_velocity, aero);
-                double ratio = norm3(aero.force) / (p.dynamics.mass * 9.81);
+                double ratio = norm3(metrics.aero.force) / (p.dynamics.mass * 9.81);
                 plate_force_sum += ratio;
                 plate_force_max = std::max(plate_force_max, ratio);
                 plate_samples += 1;
             }
+            lift_sum += metrics.plate_lift_to_weight;
+            thrust_sum += metrics.rotor_thrust_to_weight;
+            samples += 1;
             if(k < N_RECORDED && flights.is_open()){
                 T command[4];
                 for(TI i = 0; i < 4; i++) command[i] = (rlt::get(action, 0, i) + 1) / 2;  // command in [0, 1]
-                write_flight_row(flights, k, (step + 1) * p.integration.dt, next, reference, command, aero, terminated);
+                write_flight_row(flights, k, (step + 1) * p.integration.dt, next, reference, command, metrics, terminated);
                 flights << "\n";
             }
             states[k] = next;
@@ -485,6 +553,8 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
     }
     s.plate_force_to_weight = plate_samples > 0 ? plate_force_sum / plate_samples : 0;
     s.max_plate_force_to_weight = plate_force_max;
+    s.plate_lift_to_weight = samples > 0 ? lift_sum / samples : 0;
+    s.rotor_thrust_to_weight = samples > 0 ? thrust_sum / samples : 0;
     rlt::free(device, actor_state);
     rlt::free(device, actor_buffer);
     rlt::free(device, observations);
@@ -492,8 +562,15 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
     return s;
 }
 
-std::string to_json(const Summary& s){
-    auto number = [](double v){ std::ostringstream o; o << std::setprecision(8); if(std::isfinite(v)) o << v; else o << "null"; return o.str(); };
+std::string number(double v){
+    std::ostringstream o;
+    o << std::setprecision(8);
+    if(std::isfinite(v)) o << v; else o << "null";
+    return o.str();
+}
+
+std::string to_json(const Summary& s, const std::string& sweep = ""){
+    // sweep: the speed sweep's JSON object, added as "speed_sweep" when given
     std::ostringstream json;
     json << "{\n  \"test_flights\": " << N_TESTS << ",\n  \"test_seed\": 12345,\n  \"episode_steps\": " << ENVIRONMENT::EPISODE_STEP_LIMIT
          << ",\n  \"success_rate\": " << number(s.success_rate)
@@ -502,9 +579,18 @@ std::string to_json(const Summary& s){
          << ",\n  \"mean_return\": " << number(s.mean_return) << ",\n  \"mean_episode_length\": " << number(s.mean_length)
          << ",\n  \"mean_action_change\": " << number(s.mean_action_change)
          << ",\n  \"mean_plate_force_to_weight\": " << number(s.plate_force_to_weight)
-         << ",\n  \"max_plate_force_to_weight\": " << number(s.max_plate_force_to_weight) << "\n}\n";
+         << ",\n  \"max_plate_force_to_weight\": " << number(s.max_plate_force_to_weight)
+         << ",\n  \"mean_plate_lift_to_weight\": " << number(s.plate_lift_to_weight)
+         << ",\n  \"mean_rotor_thrust_to_weight\": " << number(s.rotor_thrust_to_weight);
+    if(!sweep.empty()) json << ",\n  \"speed_sweep\": " << sweep;
+    json << "\n}\n";
     return json.str();
 }
+
+// ----- speed sweep: the same references for every policy, to compare thrust and plate lift at given speeds ------------
+const std::vector<T> SWEEP_SPEEDS = {2, 2.5, 3, 3.5, 4};
+constexpr TI SWEEP_HEADINGS = 8;      // 0, 45, ..., 315 deg
+constexpr double SWEEP_STEADY_FROM = 2;  // [s] averages over t = 2-5 s: after the 1 s ramp and the transient
 
 template <typename ACTOR>
 void save_actor(DEVICE& device, const ACTOR& actor, TestSet& tests, const std::filesystem::path& path, const std::string& name){
@@ -526,7 +612,7 @@ void save_actor(DEVICE& device, const ACTOR& actor, TestSet& tests, const std::f
     rlt::malloc(device, rng);
     rlt::init(device, rng, 0);
     ENVIRONMENT env;
-    rlt::init(device, env);
+    init_environment(device, env);
     rlt::observe(device, env, tests.parameters[0], tests.starts[0], typename ENVIRONMENT::Observation{}, observation, rng);
     rlt::reset(device, forward, state, rng);
     auto input = rlt::to_tensor(device, observation);
@@ -599,6 +685,115 @@ struct Policy{
     }
 };
 
+void level_start(DEVICE& device, ENVIRONMENT& env, ENVIRONMENT::Parameters& p, ENVIRONMENT::State& s, RNG& rng, bool random_force){
+    // L2F's sampler for the parts of the state it owns, then level at rest at the origin, with the rotors and the
+    // action history at the hover command; without random_force the constant random force and torque are zero
+    whoop::sample_initial_state(device, env, p, s, rng);
+    for(TI i = 0; i < 3; i++){ s.position[i] = 0; s.linear_velocity[i] = 0; s.angular_velocity[i] = 0; }
+    s.orientation[0] = 1; s.orientation[1] = s.orientation[2] = s.orientation[3] = 0;
+    T hover = p.dynamics.hovering_throttle_relative;
+    for(TI i = 0; i < 4; i++) s.rpm[i] = hover;
+    for(TI h = 0; h < FACTORY::ACTION_HISTORY_LENGTH; h++) for(TI i = 0; i < 4; i++) s.action_history[h][i] = whoop::action_baseline(hover);
+    if(!random_force){
+        for(TI i = 0; i < 3; i++){ s.force[i] = 0; s.torque[i] = 0; }
+    }
+}
+
+std::string speed_sweep(DEVICE& device, ACTOR_FORWARD& actor, const std::filesystem::path& flights_csv){
+    // every speed of SWEEP_SPEEDS in SWEEP_HEADINGS headings: level start at rest at the origin, the velocity-task
+    // reference (1 s ramp), nominal aerodynamics of this run, no random force or torque (so that the thrust measures the
+    // aerodynamics alone, not a disturbance), sensor noise as in training. Averages over t >= SWEEP_STEADY_FROM of the
+    // flights that are not terminated. Written step by step to flights_csv (flight = speed index * 8 + heading index)
+    if constexpr(!WHOOP_TASK_VELOCITY){
+        return "";
+    }
+    else{
+        std::ofstream flights(flights_csv);
+        flights << FLIGHTS_HEADER << ",speed,heading_deg\n";
+        std::ostringstream per_flight, per_speed;
+        per_flight << std::setprecision(5);
+        per_speed << std::setprecision(5);
+        const double dt = base_parameters.integration.dt;
+        for(TI si = 0; si < SWEEP_SPEEDS.size(); si++){
+            double n_ok = 0, thrust = 0, lift = 0, force = 0, crab = 0, roll = 0, pitch = 0, alpha = 0, e_p = 0, e_v = 0, thrust_newton = 0;
+            for(TI hi = 0; hi < SWEEP_HEADINGS; hi++){
+                const TI flight = si * SWEEP_HEADINGS + hi;
+                const T heading = T(2 * 3.14159265358979323846 * hi / SWEEP_HEADINGS);
+                RNG rng;
+                rlt::malloc(device, rng);
+                rlt::init(device, rng, 1000 + flight);
+                ENVIRONMENT env;
+                init_environment(device, env);
+                ENVIRONMENT::Parameters p = env.parameters;
+                p.randomization.enabled = false;
+                p.motor_cut.probability = 0;
+                p.motor_cut.start_step = p.motor_cut.end_step = 0;
+                whoop::set_velocity_reference(device, p, heading, SWEEP_SPEEDS[si]);
+                ENVIRONMENT::State s;
+                level_start(device, env, p, s, rng, false);
+                Policy policy(device, actor, rng);
+                bool terminated = false;
+                double n = 0, f_thrust = 0, f_lift = 0, f_force = 0, f_crab = 0, f_roll = 0, f_pitch = 0, f_alpha = 0, f_ep = 0, f_ev = 0;
+                for(TI step = 0; step < ENVIRONMENT::EPISODE_STEP_LIMIT && !terminated; step++){
+                    rlt::observe(device, env, p, s, typename ENVIRONMENT::Observation{}, policy.observation, rng);
+                    policy.act(device, actor, rng);
+                    ENVIRONMENT::State next, reference;
+                    whoop::step(device, env, p, s, policy.action, next, rng);
+                    terminated = rlt::terminated(device, env, p, next, rng);
+                    desired_state(device, env, p, next, reference, rng);
+                    whoop::FlightMetrics<T> m = whoop::flight_metrics(device, p, next);
+                    T command[4];
+                    for(TI i = 0; i < 4; i++) command[i] = (rlt::get(policy.action, 0, i) + 1) / 2;
+                    double t = (step + 1) * dt;
+                    write_flight_row(flights, flight, t, next, reference, command, m, terminated);
+                    flights << "," << SWEEP_SPEEDS[si] << "," << heading * DEG << "\n";
+                    if(t >= SWEEP_STEADY_FROM - 1e-9){
+                        Angles a = euler_zyx(next.orientation);
+                        T e1[3], e2[3];
+                        for(TI i = 0; i < 3; i++){ e1[i] = next.position[i] - reference.position[i]; e2[i] = next.linear_velocity[i] - reference.linear_velocity[i]; }
+                        n += 1;
+                        f_thrust += m.rotor_thrust_to_weight;
+                        f_lift += m.plate_lift_to_weight;
+                        f_force += m.plate_force_to_weight;
+                        f_crab += crab_angle(yaw_to_path(next.orientation, reference.linear_velocity));
+                        f_roll += std::abs(a.roll);
+                        f_pitch += std::abs(a.pitch);
+                        f_alpha += m.aero.alpha * DEG;
+                        f_ep += norm3(e1) * norm3(e1);
+                        f_ev += norm3(e2) * norm3(e2);
+                    }
+                    s = next;
+                }
+                policy.free(device);
+                rlt::free(device, rng);
+                n = std::max(n, 1.0);
+                const double weight = p.dynamics.mass * 9.81;
+                per_flight << (flight == 0 ? "" : ",") << "\n      {\"flight\": " << flight << ", \"speed\": " << SWEEP_SPEEDS[si] << ", \"heading_deg\": " << heading * DEG
+                           << ", \"success\": " << (terminated ? "false" : "true") << ", \"rotor_thrust_to_weight\": " << f_thrust / n
+                           << ", \"plate_lift_to_weight\": " << f_lift / n << ", \"plate_force_to_weight\": " << f_force / n << ", \"crab_angle_deg\": " << f_crab / n
+                           << ", \"abs_roll_deg\": " << f_roll / n << ", \"abs_pitch_deg\": " << f_pitch / n << ", \"plate_alpha_deg\": " << f_alpha / n
+                           << ", \"position_rmse\": " << std::sqrt(f_ep / n) << ", \"velocity_rmse\": " << std::sqrt(f_ev / n) << "}";
+                if(!terminated){
+                    n_ok += 1;
+                    thrust += f_thrust / n; lift += f_lift / n; force += f_force / n; crab += f_crab / n; roll += f_roll / n; pitch += f_pitch / n;
+                    alpha += f_alpha / n; e_p += std::sqrt(f_ep / n); e_v += std::sqrt(f_ev / n); thrust_newton += f_thrust / n * weight;
+                }
+            }
+            double c = std::max(n_ok, 1.0);
+            auto value = [&](double v){ return n_ok > 0 ? number(v / c) : std::string("null"); };
+            per_speed << (si == 0 ? "" : ",") << "\n      {\"speed\": " << SWEEP_SPEEDS[si] << ", \"success\": " << n_ok / SWEEP_HEADINGS
+                      << ", \"rotor_thrust_to_weight\": " << value(thrust) << ", \"rotor_thrust_newton\": " << value(thrust_newton)
+                      << ", \"plate_lift_to_weight\": " << value(lift) << ", \"plate_force_to_weight\": " << value(force)
+                      << ", \"crab_angle_deg\": " << value(crab) << ", \"abs_roll_deg\": " << value(roll) << ", \"abs_pitch_deg\": " << value(pitch)
+                      << ", \"plate_alpha_deg\": " << value(alpha) << ", \"position_rmse\": " << value(e_p) << ", \"velocity_rmse\": " << value(e_v) << "}";
+        }
+        std::ostringstream json;
+        json << "{\n    \"headings\": " << SWEEP_HEADINGS << ", \"steady_from_s\": " << SWEEP_STEADY_FROM << ", \"random_force\": false,"
+             << "\n    \"per_speed\": [" << per_speed.str() << "\n    ],\n    \"flights\": [" << per_flight.str() << "\n    ]\n  }";
+        return json.str();
+    }
+}
+
 // ----- motor-cut scenario -----------------------------------------------------------------------------------------------
 struct ScenarioOptions{
     TI seeds = 5;
@@ -624,7 +819,8 @@ std::string motor_cut_scenario(DEVICE& device, ACTOR_FORWARD& actor, const Scena
         flights << FLIGHTS_HEADER << ",motors_cut\n";
         std::ostringstream json;
         json << std::setprecision(5) << "{\n  \"speed\": " << o.speed << ",\n  \"cut_time\": " << o.cut_time << ",\n  \"cut_duration\": " << o.cut_duration
-             << ",\n  \"duration\": " << o.duration << ",\n  \"plate_area\": " << FACTORY::nominal_parameters.plate.area << ",\n  \"flights\": [";
+             << ",\n  \"duration\": " << o.duration << ",\n  \"plate_area\": " << base_parameters.plate.area
+             << ",\n  \"plate_centroid_z\": " << base_parameters.plate.centroid[2] << ",\n  \"flights\": [";
         double lost_sum = 0;
         int recovered_count = 0;
         for(TI k = 0; k < o.seeds; k++){
@@ -632,7 +828,7 @@ std::string motor_cut_scenario(DEVICE& device, ACTOR_FORWARD& actor, const Scena
             rlt::malloc(device, rng);
             rlt::init(device, rng, k);
             ENVIRONMENT env;
-            rlt::init(device, env);
+            init_environment(device, env);
             // nominal aerodynamics and no random cut: this flight's cut is set here
             ENVIRONMENT::Parameters p = env.parameters;
             p.randomization.enabled = false;
@@ -668,14 +864,12 @@ std::string motor_cut_scenario(DEVICE& device, ACTOR_FORWARD& actor, const Scena
                 ENVIRONMENT::State reference;
                 desired_state(device, env, p, next, reference, rng);
                 bool terminated = rlt::terminated(device, env, p, next, rng);
-                whoop::PlateAerodynamics<T> aero{};
-                if(p.plate.area > 0){
-                    whoop::plate_aerodynamics(device, p.plate, next.orientation, next.linear_velocity, next.angular_velocity, aero);
-                }
+                whoop::FlightMetrics<T> metrics = whoop::flight_metrics(device, p, next);
+                const auto& aero = metrics.aero;
                 T command[4];
                 for(TI i = 0; i < 4; i++) command[i] = cut ? T(0) : (rlt::get(policy.action, 0, i) + 1) / 2;
                 double t = (step + 1) * dt;
-                write_flight_row(flights, k, t, next, reference, command, aero, terminated);
+                write_flight_row(flights, k, t, next, reference, command, metrics, terminated);
                 flights << "," << cut << "\n";
                 T e[3], e_v[3];
                 for(TI i = 0; i < 3; i++){ e[i] = next.position[i] - reference.position[i]; e_v[i] = next.linear_velocity[i] - reference.linear_velocity[i]; }
@@ -734,6 +928,14 @@ struct Options{
     T motor_cuts = 0;  // fraction of the training episodes with a motor cut
     std::string scenario_actor;
     ScenarioOptions scenario;
+    std::string evaluate_actor;
+    // parameters of the run (see the top of the file)
+    std::string params_file;
+    bool plate_z_set = false;
+    double plate_z = 0;
+    T thrust_cost = 0;
+    bool free_yaw = false;
+    T speed_min = FACTORY::velocity_task.speed_min, speed_max = FACTORY::velocity_task.speed_max;
 };
 
 Options parse(int argc, char** argv){
@@ -763,8 +965,18 @@ Options parse(int argc, char** argv){
         else if(a == "--cut-time") o.scenario.cut_time = std::stof(value(i, a));
         else if(a == "--cut-duration") o.scenario.cut_duration = std::stof(value(i, a));
         else if(a == "--duration") o.scenario.duration = std::stof(value(i, a));
+        else if(a == "--evaluate") o.evaluate_actor = value(i, a);
+        else if(a == "--params") o.params_file = value(i, a);
+        else if(a == "--plate-z"){ o.plate_z = std::stod(value(i, a)); o.plate_z_set = true; }
+        else if(a == "--thrust-cost") o.thrust_cost = std::stof(value(i, a));
+        else if(a == "--free-yaw") o.free_yaw = true;
+        else if(a == "--speed-min") o.speed_min = std::stof(value(i, a));
+        else if(a == "--speed-max") o.speed_max = std::stof(value(i, a));
         else throw std::runtime_error("unknown option " + a);
     }
+    if(o.thrust_cost < 0) throw std::runtime_error("--thrust-cost must be >= 0");
+    if(!(o.speed_min > 0 && o.speed_min <= o.speed_max)) throw std::runtime_error("need 0 < --speed-min <= --speed-max");
+    if(!o.scenario_actor.empty() && !o.evaluate_actor.empty()) throw std::runtime_error("--scenario and --evaluate are separate modes");
     if(o.steps >= LOOP_CORE_PARAMETERS::STEP_LIMIT) throw std::runtime_error("steps above the compiled STEP_LIMIT");
     if(o.eval_interval == 0) throw std::runtime_error("--eval-interval must be positive");
     if(o.motor_cuts < 0 || o.motor_cuts > 1) throw std::runtime_error("--motor-cuts must be in [0, 1]");
@@ -772,11 +984,67 @@ Options parse(int argc, char** argv){
     return o;
 }
 
+void set_base_parameters(const Options& o){
+    // the options that change the parameters of every environment of the run; without them base_parameters stays the
+    // compiled nominal set
+    if(!o.params_file.empty() || o.plate_z_set){
+        whoop::runtime::WhoopParams w = o.params_file.empty() ? whoop::runtime::compiled_params() : whoop::runtime::params_from_json_file(o.params_file);
+        if(o.plate_z_set) w.plate.centroid[2] = o.plate_z;
+        whoop::runtime::apply<T, TI, WHOOP_PLATE>(w, base_parameters);
+    }
+    base_parameters.mdp.reward.thrust = o.thrust_cost;
+    base_parameters.mdp.reward.tilt_only = o.free_yaw;
+    base_parameters.velocity_task.speed_min = o.speed_min;
+    base_parameters.velocity_task.speed_max = o.speed_max;
+}
+
+std::string parameters_json(const Options& o){
+    // the parameters of the run, for config.json
+    const auto& b = base_parameters;
+    std::ostringstream j;
+    j << std::setprecision(10) << "\"params_file\": \"" << std::filesystem::path(o.params_file).filename().string() << "\""
+      << ",\n  \"mass\": " << b.dynamics.mass << ",\n  \"hovering_throttle\": " << b.dynamics.hovering_throttle_relative
+      << ",\n  \"rotor_thrust_coefficients\": [" << b.dynamics.rotor_thrust_coefficients[0][0] << ", " << b.dynamics.rotor_thrust_coefficients[0][1] << ", "
+      << b.dynamics.rotor_thrust_coefficients[0][2] << "]"
+      << ",\n  \"rotor_time_constants\": [" << b.dynamics.rotor_time_constants_rising[0] << ", " << b.dynamics.rotor_time_constants_falling[0] << "]"
+      << ",\n  \"J_diagonal\": [" << b.dynamics.J[0][0] << ", " << b.dynamics.J[1][1] << ", " << b.dynamics.J[2][2] << "]"
+      << ",\n  \"rotor_torque_constant\": " << b.dynamics.rotor_torque_constants[0]
+      << ",\n  \"plate_area\": " << b.plate.area << ",\n  \"plate_centroid\": [" << b.plate.centroid[0] << ", " << b.plate.centroid[1] << ", " << b.plate.centroid[2] << "]"
+      << ",\n  \"plate_coefficients\": {\"CN90\": " << b.plate.CN90 << ", \"Kp_x\": " << b.plate.Kp_x << ", \"Kp_z\": " << b.plate.Kp_z << ", \"CT\": " << b.plate.CT
+      << ", \"e0\": " << b.plate.e0 << "}"
+      << ",\n  \"body_drag\": [" << b.body_drag[0] << ", " << b.body_drag[1] << ", " << b.body_drag[2] << "]"
+      << ",\n  \"thrust_cost\": " << b.mdp.reward.thrust << ",\n  \"free_yaw\": " << (b.mdp.reward.tilt_only ? "true" : "false")
+      << ",\n  \"velocity_task_speed\": [" << b.velocity_task.speed_min << ", " << b.velocity_task.speed_max << "]";
+    return j.str();
+}
+
+int evaluate_mode(DEVICE& device, const Options& o, const std::string& program){
+    // a trained actor on the test flights and the speed sweep, with the parameters of this run (nominal aerodynamics)
+    std::ofstream(o.out_dir / "config.json") << "{\n  \"program\": \"" << program << "\",\n  \"mode\": \"evaluate\",\n  \"actor\": \""
+        << std::filesystem::path(o.evaluate_actor).generic_string() << "\",\n  " << parameters_json(o) << "\n}\n";
+    ACTOR_FORWARD actor;
+    rlt::malloc(device, actor);
+    load_actor_tar(device, actor, o.evaluate_actor);
+    RNG rng;
+    rlt::malloc(device, rng);
+    rlt::init(device, rng, 1);
+    TestSet tests = test_set(device, 12345, false);
+    Summary s = evaluate(device, actor, tests, rng, o.out_dir / "flights.csv");
+    std::string sweep = speed_sweep(device, actor, o.out_dir / "sweep_flights.csv");
+    std::string json = to_json(s, sweep);
+    std::ofstream(o.out_dir / "evaluation.json") << json;
+    std::cout << "success " << 100 * s.success_rate << " %, position RMSE (2nd half) " << s.position_rmse_last_half << " m, velocity RMSE (2nd half) "
+              << s.velocity_rmse_last_half << " m/s, rotor thrust " << s.rotor_thrust_to_weight << " of the weight, plate lift " << s.plate_lift_to_weight << std::endl;
+    rlt::free(device, rng);
+    rlt::free(device, actor);
+    return 0;
+}
+
 int scenario(DEVICE& device, const Options& o, const std::string& program){
     std::ofstream(o.out_dir / "config.json") << std::setprecision(10) << "{\n  \"program\": \"" << program << "\",\n  \"mode\": \"motor_cut_scenario\",\n  \"actor\": \""
-        << std::filesystem::path(o.scenario_actor).filename().string() << "\",\n  \"seeds\": " << o.scenario.seeds << ",\n  \"speed\": " << o.scenario.speed
+        << std::filesystem::path(o.scenario_actor).generic_string() << "\",\n  \"seeds\": " << o.scenario.seeds << ",\n  \"speed\": " << o.scenario.speed
         << ",\n  \"cut_time\": " << o.scenario.cut_time << ",\n  \"cut_duration\": " << o.scenario.cut_duration << ",\n  \"duration\": " << o.scenario.duration
-        << ",\n  \"plate_area\": " << FACTORY::nominal_parameters.plate.area << ",\n  \"randomization\": false\n}\n";
+        << ",\n  \"randomization\": false,\n  " << parameters_json(o) << "\n}\n";
     ACTOR_FORWARD actor;
     rlt::malloc(device, actor);
     load_actor_tar(device, actor, o.scenario_actor);
@@ -791,7 +1059,9 @@ int run(int argc, char** argv){
     const std::string program = std::string("whoop_train_") + (WHOOP_TD3 ? "td3" : "sac") + (WHOOP_TASK_VELOCITY ? "_velocity" : "_hover") + (WHOOP_PLATE ? "_plate" : "_noplate");
     if(argc < 2){
         std::cerr << "usage: " << program << " <out_dir> [seed] [steps] [--eval-interval N] [--no-curriculum] [--no-randomization] [--motor-cuts P]\n"
-                  << "       " << program << " <out_dir> --scenario <actor.tar> [--scenario-seeds N] [--speed V] [--cut-time S] [--cut-duration S] [--duration S]" << std::endl;
+                  << "       " << program << " <out_dir> --scenario <actor.tar> [--scenario-seeds N] [--speed V] [--cut-time S] [--cut-duration S] [--duration S]\n"
+                  << "       " << program << " <out_dir> --evaluate <actor.tar>\n"
+                  << "  any mode: [--params FILE.json] [--plate-z Z] [--thrust-cost W] [--free-yaw] [--speed-min V] [--speed-max V]" << std::endl;
         return 1;
     }
     Options options = parse(argc, argv);
@@ -799,19 +1069,21 @@ int run(int argc, char** argv){
     std::filesystem::create_directories(out_dir);
     DEVICE device;
     rlt::init(device);
+    set_base_parameters(options);
     if(!options.scenario_actor.empty()){
         return scenario(device, options, program);
+    }
+    if(!options.evaluate_actor.empty()){
+        return evaluate_mode(device, options, program);
     }
     const TI seed = options.seed, steps = options.steps, eval_interval = options.eval_interval;
     const bool curriculum = options.curriculum;
 
-    const auto& nominal = FACTORY::nominal_parameters;
+    const auto& nominal = base_parameters;
     std::ofstream(out_dir / "config.json") << std::setprecision(10) << "{\n  \"program\": \"" << program << "\",\n  \"seed\": " << seed
         << ",\n  \"steps\": " << steps << ",\n  \"algorithm\": \"" << (WHOOP_TD3 ? "td3" : "sac") << "\",\n  \"task\": \""
         << (WHOOP_TASK_VELOCITY ? "velocity" : "hover") << "\",\n  \"plate\": " << (WHOOP_PLATE ? "true" : "false")
-        << ",\n  \"plate_area\": " << nominal.plate.area << ",\n  \"mass\": " << nominal.dynamics.mass
-        << ",\n  \"hovering_throttle\": " << nominal.dynamics.hovering_throttle_relative
-        << ",\n  \"body_drag\": [" << nominal.body_drag[0] << ", " << nominal.body_drag[1] << ", " << nominal.body_drag[2] << "]"
+        << ",\n  " << parameters_json(options)
         << ",\n  \"randomization\": " << (options.randomization ? "true" : "false")
         << ",\n  \"randomization_plate\": " << nominal.randomization.plate << ",\n  \"randomization_body_drag\": " << nominal.randomization.body_drag
         << ",\n  \"motor_cuts\": " << options.motor_cuts
@@ -825,7 +1097,6 @@ int run(int argc, char** argv){
         << ",\n  \"weight_decay\": " << WEIGHT_DECAY << ",\n  \"gamma\": 0.99,\n  \"replay_buffer\": " << WHOOP_REPLAY_BUFFER
         << ",\n  \"curriculum\": " << (curriculum ? "true" : "false") << ",\n  \"curriculum_period\": " << whoop::Curriculum<T>::PERIOD
         << ",\n  \"termination_position\": " << nominal.mdp.termination.position_threshold
-        << ",\n  \"velocity_task_speed\": [" << nominal.velocity_task.speed_min << ", " << nominal.velocity_task.speed_max << "]"
         << ",\n  \"velocity_task_ramp_time\": " << nominal.velocity_task.ramp_time
         << ",\n  \"eval_interval\": " << eval_interval << "\n}\n";
 
@@ -836,6 +1107,7 @@ int run(int argc, char** argv){
     // the training options go into the environment's parameters, from which sample_initial_parameters starts every
     // episode (the first episode is sampled at the first step, after this)
     auto& runner_env = rlt::get(runner.envs, 0, 0);
+    runner_env.parameters = base_parameters;
     runner_env.parameters.randomization.enabled = options.randomization;
     runner_env.parameters.motor_cut.probability = options.motor_cuts;
     // evaluation with its own random numbers: training is the same with or without it
@@ -852,7 +1124,7 @@ int run(int argc, char** argv){
     std::ofstream evaluation_progress(out_dir / "evaluation_progress.csv");
     evaluation_progress << "step,success_rate,position_rmse,velocity_rmse,position_rmse_last_half,velocity_rmse_last_half,mean_return,"
                            "mean_episode_length,mean_plate_force_to_weight,time_elapsed\n";
-    whoop::Reward<T> reward = whoop::reward_initial<T>;
+    whoop::Reward<T> reward = base_parameters.mdp.reward;  // the paper's initial weights, plus the thrust-cost and free-yaw options
     auto start = std::chrono::steady_clock::now();
     auto elapsed = [&](){ return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); };
     for(TI step = 1; step <= steps; step++){
@@ -884,7 +1156,15 @@ int run(int argc, char** argv){
     std::ofstream(out_dir / "runner_checks.json") << checks;
     std::cout << "runner checks: " << checks;
     Summary s = evaluate(device, rlt::get_actor(ts), tests, eval_rng, out_dir / "flights.csv");
-    std::string json = to_json(s);
+    std::string sweep;
+    {
+        ACTOR_FORWARD forward;
+        rlt::malloc(device, forward);
+        rlt::copy(device, device, rlt::get_actor(ts), forward);
+        sweep = speed_sweep(device, forward, out_dir / "sweep_flights.csv");
+        rlt::free(device, forward);
+    }
+    std::string json = to_json(s, sweep);
     std::ofstream(out_dir / "evaluation.json") << json;
     if(options.randomization){
         TestSet randomized = test_set(device, 12345, true);
@@ -903,7 +1183,7 @@ int run(int argc, char** argv){
         rlt::copy(device, device, rlt::get_actor(ts), original);
         load_actor_tar(device, loaded, out_dir / "actor.tar");
         ENVIRONMENT env;
-        rlt::init(device, env);
+        init_environment(device, env);
         Policy a(device, original, eval_rng), b(device, loaded, eval_rng);
         rlt::observe(device, env, tests.parameters[0], tests.starts[0], typename ENVIRONMENT::Observation{}, a.observation, eval_rng);
         rlt::copy(device, device, a.observation, b.observation);
@@ -918,7 +1198,7 @@ int run(int argc, char** argv){
         rlt::free(device, loaded);
         rlt::free(device, original);
     }
-    std::cout << json << "training seconds: " << seconds << std::endl;
+    std::cout << to_json(s) << "training seconds: " << seconds << std::endl;
     rlt::free(device, eval_rng);
     rlt::free(device, ts);
     return 0;

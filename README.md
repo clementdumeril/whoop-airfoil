@@ -11,11 +11,14 @@ Fly in Seconds" (RA-L 2024) and run the policy on board in Betaflight.
 ## Status
 
 - [x] Simulator: the L2F multirotor environment of RLtools with the whoop, its body drag and the plate force and
-  torque, unit tests (29/29), hover and velocity tasks, training with SAC and the L2F update intervals
+  torque, unit tests (35/35), hover and velocity tasks, training with SAC and the L2F update intervals
   ([`docs/sim.md`](docs/sim.md))
 - [x] Randomization of the plate coefficients and the body drag in training; optional motor cuts in training and a
   motor-cut scenario
-- [x] Identification tested on synthetic flights, with and without the plate ([`sysid/README.md`](sysid/README.md))
+- [x] Parameters read at run time (`--params`, `--plate-z`), an optional rotor power cost (`--thrust-cost`), a speed
+  sweep that measures rotor thrust and plate lift
+- [x] Identification tested on synthetic flights, with and without the plate ([`sysid/README.md`](sysid/README.md)),
+  and the whole chain sim-to-sim: fly a "true" drone, identify it, train on the result, fly on the truth
 - [ ] 10-seed trainings on Savio (`sim/slurm/`)
 - [ ] Real flights in the motion-capture room, identification of the real drone
 - [ ] Policy on board (rl-tools/betaflight)
@@ -39,7 +42,25 @@ averages 8 % of the weight, up to 64 %. At 1M steps the velocity task reaches 10
 Motor cuts at 3 m/s: without the plate the policy recovers from a 0.4 s cut, losing 1.1–1.6 m. With the plate it
 recovers from 0.2 s, but a longer cut rolls the whoop over before the motors return: the plate, under the centre of
 mass, makes the powerless fall unstable in roll. Trained with cuts and without the curriculum, the plate policy comes
-back from the roll-over in 3 of 5 flights, losing 1.7–3.3 m. The plate never holds the whoop up.
+back from the roll-over in 3 of 5 flights, losing 1.7–3.3 m. The plate never holds the whoop up. Moving the plate
+to the height of the centre of mass, or 4 cm above it, helps at 0.2 s cuts (z = 0: 4 of 5 back; +4 cm: no flip,
+3 of 5 back on the line), but at 0.3–0.4 s every mount flips: at z = 0 the yaw diverges instead, at +4 cm the roll
+goes the other way (one policy per mount, 5 flights each; [`docs/sim.md`](docs/sim.md)).
+
+Sim-to-sim: a "true" drone that differs from the nominal one (thrust +10 %, motors 25 % slower, drag +30 %, C_N90
++20 %, K_px −15 %, [`params/whoop_truth_example.json`](params/whoop_truth_example.json)) is flown in synthetic
+flights, identified (all within 1 % except d_z −2.7 % and C_T +10 %), and a policy trained on the identified file flies
+the truth at 97 % success and 0.18 m RMSE, as on its own model. Policies trained on the nominal file also keep 97 % on
+the truth (0.22–0.24 m): the randomization covers this truth. Two seeds each; one identified-file seed collapsed in its
+last 100k steps (37 %).
+
+Does the plate carry weight? A little, and only fast. In steady flight the rotor thrust and the plate's normal force
+are perpendicular, so the plate can at best carry 3.7 % of the weight at 3 m/s and 10.6 % at 4 m/s, for 1.8 % and
+5.3 % less rotor thrust, flying sideways with the plate face-on and banked 14–22° (`sim/tools/plate_trim.py`). The
+trained plate policy (2–4 m/s, 1M steps) reaches that bound in its best headings: 94.6 % of its weight in rotor
+thrust at 4 m/s with the plate lifting 10.2 %; over all 8 headings 96.1 % (289 mN against 296 mN for the whoop without
+the plate). A rotor power cost in the reward did not increase the saving. Figure
+[`sim/figures/plate_lift_vs_speed.png`](sim/figures/plate_lift_vs_speed.png), numbers in [`docs/sim.md`](docs/sim.md).
 
 On synthetic flights of 2 min, the identification recovers the thrust curve, motor time constants, roll and pitch
 inertia, torque constant and the plate's normal-force coefficients within about 1–2.5 % of the truth; the plate's

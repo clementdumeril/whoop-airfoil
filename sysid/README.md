@@ -31,6 +31,7 @@ added at load time, so changing noise levels does not re-simulate. Tables are wr
 | `synthetic.py` | Stabilizing controller (position PD + geometric attitude PD + yaw-last mixer), manoeuvre schedules, simulation, sensor model, cache. |
 | `identify.py` | The chain: pre-processing, motor time constant(s) and thrust curve, inertia, k_tau, body drag, plate coefficients, e0. |
 | `validate.py` | Runs the chain on synthetic data, prints the recovery tables, the per-manoeuvre identifiability, the held-out prediction RMSE, and makes the figures. |
+| `export_params.py` | Sim-to-sim test of the pipeline: flies a "true" drone given as a parameter file (`--truth`), identifies it knowing only the bench quantities of `whoop_nominal.json`, and writes the identified values as a parameter file for the simulator (`--out`, read by `train.cpp --params`) plus `<stem>_errors.json`. |
 | `figures/` | `finding_tau.png` (RMSE vs T_m with the minimum, and the 2-D rising/falling map), `thrust_fit.png` (predicted vs measured thrust, without/with motor delay), `inertia_fit.png`, `plate_cn_alpha.png` (C_N vs alpha, true vs identified, with per-sample measured C_N), `prediction_rmse.png`. |
 
 ## Model choices and assumptions
@@ -281,6 +282,35 @@ exactly, which checks that `identify.py` and `model.py` are consistent):
 | K_pz | sideways passes and sideways climbs/vertical shuttles (2.5 %); circles help (2.3 %) through tilt | in-plane wind along z only happens with roll tilt in sideways flight or with vertical speed; no data below alpha ~ 40 deg with c^2 = 0 (see `plate_cn_alpha.png`), so the small-alpha slope K_pz is the least certain normal-force parameter |
 | C_T | circles + forward passes, long flights | weak, confounded with body drag; forward (edge-on) passes alone give 18 % |
 | e0 | every manoeuvre with a normal force; circles best | from the yaw and roll moment residual; depends on k_tau and I_zz |
+
+## Sim-to-sim: a drone that is not the nominal one (`export_params.py`)
+
+`python export_params.py --truth ../params/whoop_truth_example.json --out <runs>/whoop_identified.json` (medium
+flights, nominal noise, about 3 min). The example truth has the thrust curve ×1.10, both motor time constants ×1.25,
+the body drag ×1.30, C_N90 ×1.20 and K_px ×0.85; everything measured on the bench is nominal. The truth flights are
+cached under the file's stem. With the default attitude gains, the manoeuvre controller of `synthetic.py` lost this
+drone in the sideways climbs (tilt above 80°, then divergence at t = 101 s), so its plate flight uses kR = (200, 200,
+100), kw = (28, 28, 18) (`truth_flight(..., gains=...)`, also in the cache name; at most 56° of tilt). The
+identification never sees the controller.
+
+| parameter | truth | identified | error | nominal | error of the nominal |
+|---|---|---|---|---|---|
+| thrust at u = 0.5 [N] | 0.09075 | 0.09059 | −0.2 % | 0.0825 | −9.1 % |
+| thrust at u = 1 [N] | 0.330 | 0.3299 | −0.0 % | 0.300 | −9.1 % |
+| T_rise [s] | 0.050 | 0.04965 | −0.7 % | 0.040 | −20 % |
+| T_fall [s] | 0.100 | 0.1009 | +0.9 % | 0.080 | −20 % |
+| I_xx, I_yy [kg m²] | 1.2e-5 | 1.201e-5, 1.202e-5 | +0.1 % | 1.2e-5 | 0 |
+| k_tau [m] | 0.005 | 0.00499 | −0.2 % | 0.005 | 0 |
+| d_x, d_y [kg/s] | 0.0104 | 0.0104 | −0.0 % | 0.008 | −23 % |
+| d_z [kg/s] | 0.0052 | 0.00506 | −2.7 % | 0.004 | −23 % |
+| C_N90 | 1.38 | 1.379 | −0.1 % | 1.15 | −17 % |
+| K_px | 0.714 | 0.7142 | +0.0 % | 0.84 | +18 % |
+| K_pz | 2.46 | 2.464 | +0.2 % | 2.46 | 0 |
+| C_T | 0.020 | 0.02207 | +10 % | 0.020 | 0 |
+| e0 | 0.25 | 0.2492 | −0.3 % | 0.25 | 0 |
+
+As on the nominal drone, everything but C_T comes back within 1 % (d_z within 3 %). What the policies trained on
+these files do on the truth is in `docs/sim.md` ("Sim-to-sim").
 
 ## Recommended real flights
 

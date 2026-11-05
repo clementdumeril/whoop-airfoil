@@ -1,13 +1,20 @@
-"""Animate a flight from flights.csv (written by whoop_train_*, in training or in the motor-cut scenario): the
-trajectory with the reference on the left, a close-up that follows the whoop on the right, drawn to scale with its plate
-and the plate force, and the height against time below.
+"""Animate a flight from flights.csv (written by whoop_train_*, in training, in the motor-cut scenario or in the speed
+sweep): the trajectory with the reference on the left, a close-up that follows the whoop in the middle, drawn to scale
+with its plate and the plate force, two gauges on the right (rotor thrust and plate lift in % of the weight, with the
+plate's angle of attack), and below the height and a strip chart of the same two forces against time.
 
-python animate_flight.py <flights.csv> <out.gif> [--flight K] [--title TEXT] [--every N] [--window M] [--frame T --png P]
---flight -1 (default) picks the recorded flight with the largest mean plate force, or flight 0 of a motor-cut scenario.
-When the flight covers more than the window (default 1.5 m on each side), the left camera follows the whoop.
-If the CSV has a motors_cut column, the cut is shown in red: a "MOTORS OFF" label, red rotor discs, the trajectory
-segment flown without motors and a band on the height plot.
+python animate_flight.py <flights.csv> <out.gif> [--flight K] [--pick force|lift] [--title TEXT] [--every N] [--window M]
+                         [--frame T --png P]
+--flight -1 (default) picks the recorded flight with the largest mean plate force (--pick lift: the largest mean plate
+lift), or flight 0 of a motor-cut scenario. When the flight covers more than the window (default 1.5 m on each side),
+the left camera follows the whoop. If the CSV has a motors_cut column, the cut is shown in red: a "MOTORS OFF" label,
+red rotor discs, the trajectory segment flown without motors and a band on the height plot.
 --frame T --png P writes the frame at time T [s] as a PNG instead of the animation (to check how it reads).
+
+The vehicle (mass, plate size and position) comes from config.json next to the CSV when it is there (so a run with
+--plate-z or --params is drawn as it flew), else from params/whoop_nominal.json.
+Plate lift = world-z component of the plate force; rotor thrust = sum of the four rotor thrusts; both over the weight of
+the vehicle that flew. Older CSVs without these columns get them recomputed from the rotor states and the plate force.
 """
 import argparse
 import csv
@@ -41,11 +48,32 @@ def segments(mask):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
+def vehicle(csv_path):
+    """mass, rotor positions, thrust curve, plate size and centroid of the vehicle that flew"""
+    params = json.loads(PARAMS.read_text())
+    w, plate = params["whoop"], params["plate"]
+    v = dict(rotors=np.array(w["rotor_positions"]), kf=np.array(w["rotor_thrust_coefficients"]), cx=plate["chord_x"],
+             cz=plate["height_z"], centroid=np.array(plate["centroid"], float), mass=None, plate_area=None)
+    config = Path(csv_path).with_name("config.json")
+    if config.exists():
+        c = json.loads(config.read_text())
+        v["mass"] = c.get("mass")
+        v["plate_area"] = c.get("plate_area")
+        if "plate_centroid" in c:
+            v["centroid"] = np.array(c["plate_centroid"], float)
+        if "rotor_thrust_coefficients" in c:
+            v["kf"] = np.array(c["rotor_thrust_coefficients"], float)
+    v["nominal_mass"] = w["mass"]
+    v["plate_mass"] = plate["added_mass"]
+    return v
+
+
 def main():
     a = argparse.ArgumentParser()
     a.add_argument("flights")
     a.add_argument("out")
     a.add_argument("--flight", type=int, default=-1)
+    a.add_argument("--pick", choices=["force", "lift"], default="force", help="which flight --flight -1 picks")
     a.add_argument("--title", default="")
     a.add_argument("--every", type=int, default=4, help="draw one simulation step out of N")
     a.add_argument("--window", type=float, default=1.5, help="half-width of the following camera [m]")
@@ -54,14 +82,16 @@ def main():
     args = a.parse_args()
     with open(args.flights) as f:
         rows = list(csv.DictReader(f))
-    params = json.loads(PARAMS.read_text())
-    w, plate = params["whoop"], params["plate"]
+    V = vehicle(args.flights)
     flights = sorted({int(r["flight"]) for r in rows})
     col = lambda f, c: np.array([float(r[c]) for r in rows if int(r["flight"]) == f])
     has_cut = "motors_cut" in rows[0]
+    has_lift = "plate_lift_to_weight" in rows[0]
     if args.flight < 0:
         if has_cut:
             args.flight = flights[0]
+        elif args.pick == "lift" and has_lift:
+            args.flight = max(flights, key=lambda f: np.mean(col(f, "plate_lift_to_weight")))
         else:
             args.flight = max(flights, key=lambda f: np.mean(np.sqrt(col(f, "plate_fx") ** 2 + col(f, "plate_fy") ** 2
                                                                       + col(f, "plate_fz") ** 2)))
@@ -73,21 +103,34 @@ def main():
     alpha = g("plate_alpha_deg")
     cut = g("motors_cut") > 0.5 if has_cut else np.zeros(len(t), bool)
     cut_runs = segments(cut)
-    has_plate = plate["area"] > 0 and np.any(np.abs(force) > 0)
-    weight = (w["mass"] + (plate["added_mass"] if has_plate else 0)) * 9.81
+    has_plate = (V["plate_area"] > 0) if V["plate_area"] is not None else bool(np.any(np.abs(force) > 0))
+    mass = V["mass"] if V["mass"] is not None else V["nominal_mass"] + (V["plate_mass"] if has_plate else 0)
+    weight = mass * 9.81
+    R_all = [rotation(*ang) for ang in angles]
+    if has_lift:
+        lift, thrust = g("plate_lift_to_weight"), g("rotor_thrust_to_weight")
+    else:
+        u = np.c_[g("rotor_1"), g("rotor_2"), g("rotor_3"), g("rotor_4")]
+        thrust = (V["kf"][0] + V["kf"][1] * u + V["kf"][2] * u * u).sum(axis=1) / weight
+        lift = np.array([(R @ f)[2] for R, f in zip(R_all, force)]) / weight
+    yaw_to_path = g("yaw_to_path_deg") if "yaw_to_path_deg" in rows[0] else None
 
     # the whoop in its body frame: arms to the rotors, rotor discs, and the plate rectangle in the x-z plane
-    rotors = np.array(w["rotor_positions"])
+    rotors = V["rotors"]
     disc = 0.02 * np.c_[np.cos(np.linspace(0, 2 * np.pi, 24)), np.sin(np.linspace(0, 2 * np.pi, 24)), np.zeros(24)]
-    cx, cz, c = plate["chord_x"], plate["height_z"], np.array(plate["centroid"])
+    cx, cz, c = V["cx"], V["cz"], V["centroid"]
     plate_corners = c + np.array([[-cx / 2, 0, -cz / 2], [cx / 2, 0, -cz / 2], [cx / 2, 0, cz / 2],
                                   [-cx / 2, 0, cz / 2], [-cx / 2, 0, -cz / 2]])
 
-    fig = plt.figure(figsize=(12, 7))
-    grid = fig.add_gridspec(2, 2, height_ratios=[3.2, 1], hspace=0.18, wspace=0.02, left=0.06, right=0.97, top=0.9, bottom=0.08)
+    fig = plt.figure(figsize=(13, 7.4))
+    grid = fig.add_gridspec(2, 3, height_ratios=[3.2, 1.15], width_ratios=[1, 1, 0.34], hspace=0.2, wspace=0.05, left=0.05, right=0.96,
+                            top=0.9, bottom=0.08)
     world = fig.add_subplot(grid[0, 0], projection="3d")
     close = fig.add_subplot(grid[0, 1], projection="3d")
-    height = fig.add_subplot(grid[1, :])
+    gauge = fig.add_subplot(grid[0, 2])
+    bottom = grid[1, :].subgridspec(1, 2, wspace=0.28, width_ratios=[1, 1.2])
+    height = fig.add_subplot(bottom[0, 0])
+    strip = fig.add_subplot(bottom[0, 1])
     fig.suptitle(args.title or f"Flight {args.flight + 1}", color=NAVY, fontsize=13)
     # the whole flight fits in a fixed view, or the camera follows the whoop (forward flight)
     lo, hi = np.minimum(pos.min(0), ref.min(0)) - 0.2, np.maximum(pos.max(0), ref.max(0)) + 0.2
@@ -109,7 +152,7 @@ def main():
     z_low = min(pos[:, 2].min(), ref[:, 2].min())
     if z_low < -3:
         height.set_ylim(-3, max(pos[:, 2].max(), ref[:, 2].max()) + 0.3)
-        height.text(0.99, 0.08, f"lowest point z = {z_low:.0f} m (below the plot)", transform=height.transAxes, ha="right", fontsize=9,
+        height.text(0.99, 0.88, f"lowest point z = {z_low:.0f} m (below the plot)", transform=height.transAxes, ha="right", fontsize=9,
                     color=RED)
     height.set_xlabel("t (s)", fontsize=9)
     height.set_ylabel("height z (m)", fontsize=9)
@@ -118,6 +161,52 @@ def main():
     height.grid(alpha=0.3)
     cursor = height.axvline(0, color=GREY, lw=1)
     marker, = height.plot([], [], "o", color=NAVY, ms=5)
+
+    # strip chart: rotor thrust (left axis) and plate lift (right axis), in % of the weight
+    strip.plot(t, 100 * thrust, color=NAVY, lw=1.5, label="rotor thrust")
+    strip.axhline(100, color=NAVY, lw=0.8, ls=":")
+    strip.set_xlim(0, t[-1])
+    thr_lo, thr_hi = np.percentile(100 * thrust, [2, 98])
+    strip.set_ylim(min(80, thr_lo - 5), max(120, thr_hi + 5))
+    strip.set_ylabel("rotor thrust (% weight)", fontsize=9, color=NAVY)
+    strip.tick_params(labelsize=8)
+    strip.set_xlabel("t (s)", fontsize=9)
+    strip.grid(alpha=0.3)
+    strip2 = strip.twinx()
+    strip2.plot(t, 100 * lift, color=TEAL, lw=1.5, label="plate lift")
+    strip2.axhline(0, color=TEAL, lw=0.8, ls=":")
+    strip2.set_ylim(-10, max(20, np.percentile(100 * lift, 98) + 3))
+    strip2.set_ylabel("plate lift (% weight)", fontsize=9, color=TEAL)
+    strip2.tick_params(labelsize=8)
+    strip.legend(handles=strip.get_lines()[:1] + strip2.get_lines()[:1], loc="upper right", fontsize=8, frameon=False, ncol=2)
+    strip_cursor = strip.axvline(0, color=GREY, lw=1)
+    for s, e in cut_runs:
+        strip.axvspan(t[s] - (t[1] - t[0]), t[e - 1], color=RED, alpha=0.15, lw=0)
+
+    def draw_gauges(i):
+        # two vertical bars on their own scales: rotor thrust 0-150 % and plate lift -10-30 %; the weight (100 %) and 0
+        # are marked. The angle of attack and the heading to the path are written below
+        gauge.cla()
+        gauge.set_xlim(0, 2)
+        gauge.set_ylim(0, 1)
+        gauge.axis("off")
+        bars = [("rotor\nthrust", 100 * thrust[i], 0, 150, 100, RED if cut[i] else NAVY),
+                ("plate\nlift", 100 * lift[i], -10, 30, 0, TEAL)]
+        for k, (name, value, vmin, vmax, mark, color) in enumerate(bars):
+            x0, bottom, top = 0.25 + k, 0.2, 0.92
+            scale = lambda v: bottom + (np.clip(v, vmin, vmax) - vmin) / (vmax - vmin) * (top - bottom)
+            gauge.add_patch(plt.Rectangle((x0, bottom), 0.5, top - bottom, fc="#F1F1F1", ec=GREY, lw=1))
+            base = scale(max(vmin, 0) if vmin < 0 else vmin)
+            gauge.add_patch(plt.Rectangle((x0, min(base, scale(value))), 0.5, abs(scale(value) - base), fc=color, ec="none"))
+            gauge.plot([x0 - 0.06, x0 + 0.56], [scale(mark)] * 2, color="black", lw=1.2)
+            gauge.text(x0 + 0.62 if k == 0 else x0 - 0.08, scale(mark), "weight" if k == 0 else "0", fontsize=7,
+                       ha="left" if k == 0 else "right", va="center")
+            gauge.text(x0 + 0.25, top + 0.02, f"{value:.0f} %", ha="center", va="bottom", fontsize=12, color=color, fontweight="bold")
+            gauge.text(x0 + 0.25, bottom - 0.02, name, ha="center", va="top", fontsize=9)
+        info = f"α = {alpha[i]:.0f}°" if has_plate else "no plate"
+        if yaw_to_path is not None:
+            info += f"\nyaw to path {yaw_to_path[i]:+.0f}°"
+        gauge.text(1.0, 0.02, info, ha="center", va="bottom", fontsize=10, color=NAVY)
 
     def draw(i):
         for ax in (world, close):
@@ -142,25 +231,37 @@ def main():
         world.legend(loc="upper left", fontsize=8, frameon=False)
         world.set_title(f"t = {t[i]:.2f} s, {speed[i]:.1f} m/s, height {pos[i, 2] - ref[i, 2]:+.2f} m from the reference", fontsize=10)
 
-        R, p = rotation(*angles[i]), pos[i]
+        R, p = R_all[i], pos[i]
         body = lambda pts: (R @ pts.T).T + p
         for r in rotors:
             close.plot(*body(np.array([[0, 0, 0], r])).T, color=GREY, lw=2)
             close.plot(*body(disc + r).T, color=RED if off else NAVY, lw=2.5 if off else 1.5, ls="--" if off else "-")
+        # the flight direction, through the centre of mass
+        v = (pos[min(i + 1, len(t) - 1)] - pos[max(i - 1, 0)])
+        if np.linalg.norm(v) > 1e-6:
+            v = 0.09 * v / np.linalg.norm(v)
+            close.quiver(*p, *v, color=ORANGE, lw=1.2, ls="--", arrow_length_ratio=0.25)
         if has_plate:
             corners = body(plate_corners)
             close.plot(*corners.T, color=TEAL, lw=2.5)
             close.add_collection3d(Poly3DCollection([corners[:4]], color=TEAL, alpha=0.35))
             f_world = R @ force[i]
             start = body(c[None])[0]
-            close.quiver(*start, *(0.25 * f_world / weight), color=ORANGE, lw=2)  # 0.25 m = one weight
-            close.set_title(f"plate force {np.linalg.norm(force[i]) / weight * 100:.0f} % of the weight, "
-                            f"α = {alpha[i]:.0f}°\nroll {angles[i, 0]:.0f}°, pitch {angles[i, 1]:.0f}°", fontsize=10)
+            close.quiver(*start, *(0.4 * f_world / weight), color=ORANGE, lw=2)  # 0.4 m = one weight
+            # its vertical part, the lift, on the same scale (teal, upward when the plate carries weight)
+            if abs(f_world[2]) > 1e-4 * weight:
+                close.quiver(*start, 0, 0, 0.4 * f_world[2] / weight, color=TEAL, lw=3, arrow_length_ratio=0.3)
+            close.set_title(f"plate force {np.linalg.norm(force[i]) / weight * 100:.0f} % of the weight (orange), "
+                            f"its vertical part (teal)\nroll {angles[i, 0]:.0f}°, pitch {angles[i, 1]:.0f}°", fontsize=10)
         else:
             close.set_title(f"no plate\nroll {angles[i, 0]:.0f}°, pitch {angles[i, 1]:.0f}°", fontsize=10)
         if off:
             close.text2D(0.5, 0.9, "MOTORS OFF", transform=close.transAxes, ha="center", va="center", fontsize=18,
                          fontweight="bold", color="white", bbox=dict(boxstyle="round,pad=0.3", fc=RED, ec=RED))
+        # the close-up camera looks at the plate's face, 60 deg off its normal and from slightly above, whatever the
+        # heading (the default view sees a crabbed plate edge-on)
+        normal_world = R @ np.array([0.0, 1.0, 0.0])
+        close.view_init(elev=22, azim=np.degrees(np.arctan2(normal_world[1], normal_world[0])) + 60)
         h = 0.12
         close.set_xlim(p[0] - h, p[0] + h)
         close.set_ylim(p[1] - h, p[1] + h)
@@ -169,7 +270,9 @@ def main():
         close.set_xticks([])
         close.set_yticks([])
         close.set_zticks([])
+        draw_gauges(i)
         cursor.set_xdata([t[i], t[i]])
+        strip_cursor.set_xdata([t[i], t[i]])
         marker.set_data([t[i]], [pos[i, 2]])
         marker.set_color(RED if off else NAVY)
         return []

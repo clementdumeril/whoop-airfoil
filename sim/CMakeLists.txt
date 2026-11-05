@@ -54,6 +54,8 @@ endfunction()
 # unit tests: no fast-math and no contraction into fused multiply-adds, so that "S = 0 gives exactly the L2F
 # dynamics" is tested bit for bit
 whoop_executable(whoop_test tests/test_whoop.cpp)
+# the tests read the parameter files at run time (whoop/params_runtime.h) and compare them with the compiled ones
+target_compile_definitions(whoop_test PRIVATE WHOOP_PARAMS_JSON_PATH="${WHOOP_PARAMS_JSON}" WHOOP_PARAMS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../params")
 if(NOT MSVC)
     target_compile_options(whoop_test PRIVATE -O2 -ffp-contract=off)
 endif()

@@ -19,6 +19,7 @@
 #include <whoop/environment.h>
 #include <rl_tools/rl/environments/l2f/operations_generic.h>
 
+#include <cmath>
 #include <type_traits>
 
 namespace whoop{
@@ -250,8 +251,40 @@ namespace whoop{
         return 2 * hovering_throttle_relative - 1;
     }
 
+    template <typename DYNAMICS>
+    auto rotor_power_model(const DYNAMICS& dynamics){
+        // the four rotors share one thrust curve in the whoop parameters (rotor 0 stands for all)
+        using T = std::decay_t<decltype(dynamics.mass)>;
+        RotorPower<T> model;
+        for(int j = 0; j < 3; j++) model.thrust_coefficients[j] = dynamics.rotor_thrust_coefficients[0][j];
+        T g = std::sqrt(dynamics.gravity[0] * dynamics.gravity[0] + dynamics.gravity[1] * dynamics.gravity[1] + dynamics.gravity[2] * dynamics.gravity[2]);
+        model.hover_thrust = dynamics.mass * g / 4;
+        return model;
+    }
+
     template <typename T>
-    T reward_from_errors(const Reward<T>& r, const T position_error[3], T orientation_cost, const T linear_velocity_error[3], const T angular_velocity[3], const T* action, T baseline, bool terminated){
+    T rotor_thrust_from_command(const RotorPower<T>& model, T u){
+        // thrust of one rotor at the normalized motor command u in [0, 1], never negative (an identified c0 < 0 would
+        // otherwise make the power of an idle rotor undefined)
+        u = u < 0 ? 0 : (u > 1 ? 1 : u);
+        T f = model.thrust_coefficients[0] + model.thrust_coefficients[1] * u + model.thrust_coefficients[2] * u * u;
+        return f > 0 ? f : 0;
+    }
+
+    template <typename T>
+    T power_cost(const RotorPower<T>& model, const T* action){
+        // mean_i (f_i / f_hover)^1.5 - 1 for the commanded thrusts; the action is in [-1, 1], the command (a + 1) / 2
+        // as in L2F's step for an action limit of [0, 1]. Zero at the hover command
+        T sum = 0;
+        for(int i = 0; i < 4; i++){
+            T ratio = rotor_thrust_from_command(model, (action[i] + 1) / 2) / model.hover_thrust;
+            sum += ratio * std::sqrt(ratio);
+        }
+        return sum / 4 - 1;
+    }
+
+    template <typename T>
+    T reward_from_errors(const Reward<T>& r, const T position_error[3], T orientation_cost, const T linear_velocity_error[3], const T angular_velocity[3], const T* action, T baseline, const RotorPower<T>& power, bool terminated){
         if(terminated){
             return r.termination_penalty;
         }
@@ -266,16 +299,21 @@ namespace whoop{
         }
         T cost = r.position * position + r.orientation * orientation_cost + r.linear_velocity * linear_velocity
                + r.angular_velocity * angular_velocity_cost + r.action * action_cost;
+        if(r.thrust != 0){
+            // only when the option is on, so that the paper's reward is computed exactly as before
+            cost += r.thrust * power_cost(power, action);
+        }
         return r.constant - r.scale * cost;
     }
 
     template <typename T>
-    T reward_from_privileged_observation(const Reward<T>& r, const T* observation, const T* action, T baseline, bool terminated){
+    T reward_from_privileged_observation(const Reward<T>& r, const T* observation, const T* action, T baseline, const RotorPower<T>& power, bool terminated){
         // the same reward from the critic's observation of the state before the step (position error, rotation
         // matrix, velocity error, angular velocity: environment.h), to recompute the replay buffer after a curriculum
-        // step as L2F does. 1 - q_w^2 = (3 - trace R) / 4
-        T orientation_cost = (3 - (observation[3] + observation[7] + observation[11])) / 4;
-        return reward_from_errors(r, observation, orientation_cost, observation + 12, observation + 15, action, baseline, terminated);
+        // step as L2F does. 1 - q_w^2 = (3 - trace R) / 4; the tilt alone is (1 - R_zz) / 2. The power cost needs
+        // only the stored action
+        T orientation_cost = r.tilt_only ? (1 - observation[11]) / 2 : (3 - (observation[3] + observation[7] + observation[11])) / 4;
+        return reward_from_errors(r, observation, orientation_cost, observation + 12, observation + 15, action, baseline, power, terminated);
     }
 
     template <typename DEVICE, typename SPEC, typename WHOOP_SPEC, typename STATE, typename ACTION_SPEC, typename RNG>
@@ -292,10 +330,12 @@ namespace whoop{
         for(TI i = 0; i < 4; i++){
             a[i] = rlt::get(action, 0, i);
         }
-        T orientation_cost = 1 - state.orientation[0] * state.orientation[0];
+        const auto& r = parameters.mdp.reward;
+        T orientation_cost = r.tilt_only ? state.orientation[1] * state.orientation[1] + state.orientation[2] * state.orientation[2]
+                                         : 1 - state.orientation[0] * state.orientation[0];
         bool terminated = rlt::terminated(device, env, parameters, next_state, rng);
-        return reward_from_errors(parameters.mdp.reward, position_error, orientation_cost, linear_velocity_error, state.angular_velocity, a,
-                                  action_baseline(parameters.dynamics.hovering_throttle_relative), terminated);
+        return reward_from_errors(r, position_error, orientation_cost, linear_velocity_error, state.angular_velocity, a,
+                                  action_baseline(parameters.dynamics.hovering_throttle_relative), rotor_power_model(parameters.dynamics), terminated);
     }
 
     template <typename DEVICE, typename SPEC, typename WHOOP_SPEC, typename STATE, typename ACTION_SPEC, typename RNG>

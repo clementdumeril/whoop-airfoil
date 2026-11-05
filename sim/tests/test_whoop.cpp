@@ -6,6 +6,8 @@
 #include <rl_tools/operations/cpu_mux.h>
 
 #include <whoop/operations.h>
+#include <whoop/params_runtime.h>
+#include <whoop/metrics.h>
 
 #include <cmath>
 #include <cstring>
@@ -449,15 +451,18 @@ void test_hover(DEVICE& device, const std::string& name){
 }
 
 template <whoop::Task TASK>
-void test_observation_and_reward(DEVICE& device, const std::string& name){
+void test_observation_and_reward(DEVICE& device, const std::string& name, float thrust_cost = 0, bool tilt_only = false){
     // the actor sees the absolute linear velocity, and the reward recomputed from the critic's observation (used after a
-    // curriculum step) equals the reward of the environment
+    // curriculum step) equals the reward of the environment; also with the power cost and the tilt-only orientation
+    // cost (train.cpp --thrust-cost, --free-yaw)
     using T = float;
     using FACTORY = whoop::EnvironmentFactory<T, TI, true, TASK>;
     using ENV = typename FACTORY::ENVIRONMENT;
     ENV env;
     rlt::init(device, env);
-    typename ENV::Parameters parameters = FACTORY::nominal_parameters;
+    env.parameters.mdp.reward.thrust = thrust_cost;
+    env.parameters.mdp.reward.tilt_only = tilt_only;
+    typename ENV::Parameters parameters = env.parameters;
     RNG rng;
     rlt::malloc(device, rng);
     rlt::init(device, rng, 11);
@@ -467,7 +472,7 @@ void test_observation_and_reward(DEVICE& device, const std::string& name){
     rlt::malloc(device, observation);
     rlt::malloc(device, privileged);
     rlt::malloc(device, action);
-    double max_velocity_error = 0, max_reward_error = 0;
+    double max_velocity_error = 0, max_reward_error = 0, reward_sum = 0;
     int n = 0, terminated = 0;
     for(int episode = 0; episode < 20; episode++){
         whoop::sample_initial_parameters(device, env, parameters, rng);
@@ -489,18 +494,23 @@ void test_observation_and_reward(DEVICE& device, const std::string& name){
             T o[ENV::ObservationPrivileged::DIM];
             for(TI i = 0; i < ENV::ObservationPrivileged::DIM; i++) o[i] = rlt::get(privileged, 0, i);
             T recomputed = whoop::reward_from_privileged_observation(parameters.mdp.reward, o, a,
-                                                                       whoop::action_baseline(parameters.dynamics.hovering_throttle_relative), done);
+                                                                       whoop::action_baseline(parameters.dynamics.hovering_throttle_relative),
+                                                                       whoop::rotor_power_model(parameters.dynamics), done);
             max_reward_error = std::max(max_reward_error, (double)std::fabs(r - recomputed));
+            if(!done) reward_sum += r;
             n++;
             terminated += done;
             if(done) break;
             s = next;
         }
     }
-    check(max_velocity_error < 0.02, "actor observes the absolute linear velocity, " + name,
-          "index " + numbers({double(FACTORY::OBSERVATION_LINEAR_VELOCITY_INDEX)}) + ", max |obs - v| " + numbers({max_velocity_error}) + " m/s (noise std 0.002)");
+    if(thrust_cost == 0 && !tilt_only){
+        check(max_velocity_error < 0.02, "actor observes the absolute linear velocity, " + name,
+              "index " + numbers({double(FACTORY::OBSERVATION_LINEAR_VELOCITY_INDEX)}) + ", max |obs - v| " + numbers({max_velocity_error}) + " m/s (noise std 0.002)");
+    }
     check(max_reward_error < 1e-4, "reward from the critic observation = environment reward, " + name,
-          numbers({double(n)}) + " steps, " + numbers({double(terminated)}) + " terminations, max diff " + numbers({max_reward_error}));
+          numbers({double(n)}) + " steps, " + numbers({double(terminated)}) + " terminations, max diff " + numbers({max_reward_error}) +
+          ", mean reward " + numbers({reward_sum / std::max(1, n - terminated)}));
     rlt::free(device, observation);
     rlt::free(device, privileged);
     rlt::free(device, action);
@@ -535,6 +545,138 @@ void test_initial_states(DEVICE& device){
     rlt::free(device, rng);
 }
 
+// the parameter files, passed by CMake (sim/CMakeLists.txt)
+#ifndef WHOOP_PARAMS_JSON_PATH
+#error "WHOOP_PARAMS_JSON_PATH (params/whoop_nominal.json) must be defined by the build"
+#endif
+#ifndef WHOOP_PARAMS_DIR
+#error "WHOOP_PARAMS_DIR (params/) must be defined by the build"
+#endif
+
+template <typename T, bool PLATE, whoop::Task TASK>
+bool runtime_equals_compiled(const whoop::runtime::WhoopParams& w, double& max_diff){
+    // the nominal parameter struct, then the JSON applied on top of a copy: every byte must be the same
+    using FACTORY = whoop::EnvironmentFactory<T, TI, PLATE, TASK>;
+    typename FACTORY::ENVIRONMENT::Parameters p = FACTORY::nominal_parameters;
+    whoop::runtime::apply<T, TI, PLATE>(w, p);
+    const auto& n = FACTORY::nominal_parameters;
+    max_diff = 0;
+    for(int i = 0; i < 3; i++) for(int j = 0; j < 3; j++){
+        max_diff = std::max(max_diff, (double)std::fabs(p.dynamics.J[i][j] - n.dynamics.J[i][j]));
+        max_diff = std::max(max_diff, (double)std::fabs(p.dynamics.J_inv[i][j] - n.dynamics.J_inv[i][j]) * 1e-10);  // J^-1 ~ 1e5
+    }
+    max_diff = std::max(max_diff, (double)std::fabs(p.dynamics.hovering_throttle_relative - n.dynamics.hovering_throttle_relative));
+    return std::memcmp(&p, &n, sizeof(p)) == 0;
+}
+
+void test_runtime_params(DEVICE& device){
+    // --params: the nominal JSON read at run time gives the compiled parameters bit for bit, for both masses, both
+    // tasks and both floating-point types
+    namespace rt = whoop::runtime;
+    rt::WhoopParams json = rt::params_from_json_file(WHOOP_PARAMS_JSON_PATH);
+    rt::WhoopParams compiled = rt::compiled_params();
+    bool same_values = std::memcmp(&json, &compiled, sizeof(json)) == 0;
+    double d1, d2, d3, d4;
+    bool a = runtime_equals_compiled<double, true, whoop::Task::HOVER>(json, d1);
+    bool b = runtime_equals_compiled<double, false, whoop::Task::VELOCITY>(json, d2);
+    bool c = runtime_equals_compiled<float, true, whoop::Task::VELOCITY>(json, d3);
+    bool d = runtime_equals_compiled<float, false, whoop::Task::HOVER>(json, d4);
+    check(same_values && a && b && c && d, "runtime parameters (--params) of the nominal JSON = the compiled parameters, bit for bit",
+          "JSON values " + std::string(same_values ? "identical" : "DIFFERENT") + "; double plate hover, double no-plate velocity, float plate velocity, "
+          "float no-plate hover: " + numbers({double(a), double(b), double(c), double(d)}) + ", max diff of derived values " + numbers({d1, d2, d3, d4}));
+
+    // the example truth: thrust curve x1.1, time constants x1.25, drag x1.3, C_N90 x1.2, K_px x0.85, and the hover
+    // command recomputed from the new thrust curve
+    rt::WhoopParams truth = rt::params_from_json_file(std::string(WHOOP_PARAMS_DIR) + "/whoop_truth_example.json");
+    using FACTORY = whoop::EnvironmentFactory<double, TI, true, whoop::Task::VELOCITY>;
+    FACTORY::ENVIRONMENT::Parameters p = FACTORY::nominal_parameters;
+    rt::apply<double, TI, true>(truth, p);
+    const auto& n = FACTORY::nominal_parameters;
+    const auto& dyn = p.dynamics;
+    double u = dyn.hovering_throttle_relative;
+    double hover_thrust = dyn.rotor_thrust_coefficients[0][0] + dyn.rotor_thrust_coefficients[0][1] * u + dyn.rotor_thrust_coefficients[0][2] * u * u;
+    bool scaled = std::fabs(dyn.rotor_thrust_coefficients[2][2] / n.dynamics.rotor_thrust_coefficients[2][2] - 1.1) < 1e-12 &&
+                  std::fabs(dyn.rotor_time_constants_rising[1] / n.dynamics.rotor_time_constants_rising[1] - 1.25) < 1e-12 &&
+                  std::fabs(dyn.rotor_time_constants_falling[3] / n.dynamics.rotor_time_constants_falling[3] - 1.25) < 1e-12 &&
+                  std::fabs(p.body_drag[2] / n.body_drag[2] - 1.3) < 1e-12 && std::fabs(p.plate.CN90 / n.plate.CN90 - 1.2) < 1e-12 &&
+                  std::fabs(p.plate.Kp_x / n.plate.Kp_x - 0.85) < 1e-12 && p.plate.Kp_z == n.plate.Kp_z && dyn.mass == n.dynamics.mass &&
+                  std::memcmp(dyn.J, n.dynamics.J, sizeof(dyn.J)) == 0;
+    check(scaled && std::fabs(4 * hover_thrust - dyn.mass * 9.81) < 1e-12 && u < n.dynamics.hovering_throttle_relative,
+          "runtime parameters of params/whoop_truth_example.json", "hover command " + numbers({u, n.dynamics.hovering_throttle_relative}) +
+          " (truth, nominal), 4 f(u_h) - m g = " + numbers({4 * hover_thrust - dyn.mass * 9.81}) + " N");
+
+    // --plate-z: the plate at the height of the centre of mass. Its inertia then has no parallel-axis part about x
+    // and y, so J_total = J + J_sheet exactly; and the plate force there gives no roll moment
+    rt::WhoopParams level = rt::compiled_params();
+    level.plate.centroid[2] = 0;
+    p = FACTORY::nominal_parameters;
+    rt::apply<double, TI, true>(level, p);
+    double m_p = level.plate.added_mass, c_x = level.plate.chord_x, c_z = level.plate.height_z;
+    double J_expected[3] = {level.J[0][0] + m_p * c_z * c_z / 12, level.J[1][1] + m_p * (c_x * c_x + c_z * c_z) / 12, level.J[2][2] + m_p * c_x * c_x / 12};
+    double dJ = 0;
+    for(int i = 0; i < 3; i++) dJ = std::max(dJ, std::fabs(p.dynamics.J[i][i] - J_expected[i]) / J_expected[i]);
+    const double identity[4] = {1, 0, 0, 0}, side[3] = {0, 3, 0}, zero[3] = {0, 0, 0};
+    whoop::PlateAerodynamics<double> aero;
+    whoop::plate_aerodynamics(device, p.plate, identity, side, zero, aero);
+    check(dJ < 1e-14 && p.plate.centroid[2] == 0 && aero.torque[0] == 0 && n.dynamics.J[0][0] > p.dynamics.J[0][0],
+          "--plate-z 0: inertia J + J_sheet, no roll moment from a side wind",
+          "J_xx " + numbers({p.dynamics.J[0][0], n.dynamics.J[0][0]}) + " (z = 0, nominal z = -0.04), max rel diff " + numbers({dJ}) + ", tau_x " + numbers({aero.torque[0]}));
+}
+
+void test_power_cost(DEVICE&){
+    // the rotor power cost of --thrust-cost: zero at the hover command, (f / f_hover)^1.5 - 1 otherwise
+    using FACTORY = whoop::EnvironmentFactory<double, TI, true, whoop::Task::VELOCITY>;
+    const auto& dyn = FACTORY::nominal_parameters.dynamics;
+    auto model = whoop::rotor_power_model(dyn);
+    double a_hover = whoop::action_baseline(dyn.hovering_throttle_relative);
+    double hover[4] = {a_hover, a_hover, a_hover, a_hover};
+    double full[4] = {1, 1, 1, 1};
+    double mixed[4] = {-1, 1, a_hover, a_hover};
+    double f_full = dyn.rotor_thrust_coefficients[0][0] + dyn.rotor_thrust_coefficients[0][1] + dyn.rotor_thrust_coefficients[0][2];
+    double f_h = dyn.mass * 9.81 / 4;
+    double expected_full = std::pow(f_full / f_h, 1.5) - 1;
+    double expected_mixed = (0 + std::pow(f_full / f_h, 1.5) + 2) / 4 - 1;
+    double c_hover = whoop::power_cost(model, hover), c_full = whoop::power_cost(model, full), c_mixed = whoop::power_cost(model, mixed);
+    // in the reward: the cost enters as - scale * thrust * power_cost, nothing else changes
+    whoop::Reward<double> r = whoop::reward_initial<double>;
+    double zero3[3] = {0, 0, 0};
+    double r_off = whoop::reward_from_errors(r, zero3, 0.0, zero3, zero3, full, a_hover, model, false);
+    r.thrust = 2;
+    double r_on = whoop::reward_from_errors(r, zero3, 0.0, zero3, zero3, full, a_hover, model, false);
+    check(std::fabs(c_hover) < 1e-12 && std::fabs(c_full - expected_full) < 1e-12 && std::fabs(c_mixed - expected_mixed) < 1e-12 &&
+          std::fabs((r_off - r_on) - r.scale * 2 * expected_full) < 1e-12,
+          "power cost: 0 at hover, mean (f / f_hover)^1.5 - 1", "full command " + numbers({c_full, expected_full}) + ", one rotor off and one full " +
+          numbers({c_mixed, expected_mixed}) + ", reward change with thrust = 2: " + numbers({r_off - r_on}));
+}
+
+void test_plate_lift_metric(DEVICE& device){
+    // the evaluation's plate lift (world z of the plate force / m g) and rotor thrust / m g (whoop/metrics.h)
+    using FACTORY = whoop::EnvironmentFactory<double, TI, true, whoop::Task::VELOCITY>;
+    using ENV = FACTORY::ENVIRONMENT;
+    ENV::Parameters p = FACTORY::nominal_parameters;
+    ENV::State s{};
+    // 1. flying sideways (+y world) at 3 m/s with the plate face-on, level: the force is horizontal, no lift
+    s.orientation[0] = 1;
+    s.linear_velocity[1] = 3;
+    for(int i = 0; i < 4; i++) s.rpm[i] = p.dynamics.hovering_throttle_relative;
+    auto level = whoop::flight_metrics(device, p, s);
+    // 2. the same, rolled by -20 deg (left side down, as a quadrotor banks to fly left): the normal force tilts up
+    double phi = -20 * PI / 180;
+    s.orientation[0] = std::cos(phi / 2);
+    s.orientation[1] = std::sin(phi / 2);
+    auto banked = whoop::flight_metrics(device, p, s);
+    Expected e = expected_plate(p.plate, s.orientation, s.linear_velocity, s.angular_velocity);
+    // world z of R F for a roll about x: F_y sin(phi) + F_z cos(phi)
+    double lift_expected = (e.F[1] * std::sin(phi) + e.F[2] * std::cos(phi)) / (p.dynamics.mass * 9.81);
+    double force_expected = norm3(e.F) / (p.dynamics.mass * 9.81);
+    check(std::fabs(level.plate_lift_to_weight) < 1e-15 && level.plate_force_to_weight > 0.1 && std::fabs(level.rotor_thrust_to_weight - 1) < 1e-12 &&
+          banked.plate_lift_to_weight > 0.01 && std::fabs(banked.plate_lift_to_weight - lift_expected) < 1e-12 &&
+          std::fabs(banked.plate_force_to_weight - force_expected) < 1e-12,
+          "plate lift metric: world z of the plate force / m g; rotor thrust / m g = 1 at hover",
+          "level, face-on at 3 m/s: lift " + numbers({level.plate_lift_to_weight}) + ", force " + numbers({level.plate_force_to_weight}) +
+          "; banked 20 deg: lift " + numbers({banked.plate_lift_to_weight, lift_expected}) + ", rotor thrust at hover " + numbers({level.rotor_thrust_to_weight}));
+}
+
 int main(){
     DEVICE device;
     rlt::init(device);
@@ -553,7 +695,11 @@ int main(){
     test_hover<true>(device, "plate");
     test_observation_and_reward<whoop::Task::HOVER>(device, "hover");
     test_observation_and_reward<whoop::Task::VELOCITY>(device, "velocity task");
+    test_observation_and_reward<whoop::Task::VELOCITY>(device, "velocity task, thrust cost 2 and tilt-only orientation", 2.0f, true);
     test_initial_states(device);
+    test_runtime_params(device);
+    test_power_cost(device);
+    test_plate_lift_metric(device);
     std::cout << (failures == 0 ? "all checks passed" : std::to_string(failures) + " check(s) failed") << std::endl;
     return failures == 0 ? 0 : 1;
 }

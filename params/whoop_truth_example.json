@@ -1,0 +1,39 @@
+{
+  "_comment": "A 'true' whoop for the sim-to-sim test of the pipeline (synthetic flights -> identification -> training -> evaluation): it differs from whoop_nominal.json on purpose, in what identification has to find. Changes: thrust curve x1.10 (each coefficient), both motor time constants x1.25, body drag x1.30 (each component), plate C_N90 x1.20, plate K_px x0.85. Everything that is measured on the bench (mass, geometry, inertia, torque constant, plate size, K_pz, C_T, e0) is the nominal value. Same format as whoop_nominal.json, so the simulator (--params), the identification and generate_params.py can all read it.",
+  "whoop": {
+    "mass": 0.030,
+    "gravity": [0, 0, -9.81],
+    "rotor_positions": [[0.0265, -0.0265, 0], [-0.0265, -0.0265, 0], [-0.0265, 0.0265, 0], [0.0265, 0.0265, 0]],
+    "rotor_thrust_directions": [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]],
+    "rotor_torque_directions": [[0, 0, -1], [0, 0, 1], [0, 0, -1], [0, 0, 1]],
+    "_thrust": "nominal [0.0, 0.03, 0.27] x 1.10",
+    "rotor_thrust_coefficients": [0.0, 0.033, 0.297],
+    "rotor_torque_constant": 0.005,
+    "_time_constants": "nominal 0.04 / 0.08 s x 1.25",
+    "rotor_time_constant_rising": 0.05,
+    "rotor_time_constant_falling": 0.1,
+    "J": [[1.2e-05, 0, 0], [0, 1.2e-05, 0], [0, 0, 2.2e-05]],
+    "_body_drag": "nominal [0.008, 0.008, 0.004] x 1.30",
+    "body_drag": [0.0104, 0.0104, 0.0052]
+  },
+  "plate": {
+    "added_mass": 0.0007,
+    "chord_x": 0.12,
+    "height_z": 0.065,
+    "area": 0.0078,
+    "normal": [0, 1, 0],
+    "centroid": [0, 0, -0.04],
+    "_coefficients": "C_N90 nominal 1.15 x 1.20, K_px nominal 0.84 x 0.85; the others nominal",
+    "CN90": 1.38,
+    "Kp_x": 0.714,
+    "Kp_z": 2.46,
+    "CT": 0.02,
+    "e0": 0.25,
+    "downwash_factor": 0.0,
+    "air_density": 1.2
+  },
+  "randomization": {
+    "plate": 0.4,
+    "body_drag": 0.5
+  }
+}
