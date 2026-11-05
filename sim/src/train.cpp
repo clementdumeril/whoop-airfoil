@@ -34,6 +34,9 @@
 //   --params FILE     the whoop and plate parameters from a JSON in the format of params/whoop_nominal.json instead of
 //                     the compiled ones (to train on identified parameters, or to fly a policy on a "true" drone)
 //   --plate-z Z       the plate centroid height relative to the centre of mass [m] (nominal -0.04); the inertia follows
+//   --plate-tilt DEG  the plate tilted by DEG about body x: normal (0, cos, sin), chord along body x (0 = the nominal
+//                     vertical plate, 90 = horizontal); the inertia follows
+//   --downwash K      the crude downwash term on the plate, k_w = K (docs/plate_model.md; nominal 0 = none)
 //   --thrust-cost W   a rotor power cost of weight W in the reward (whoop::Reward::thrust, environment.h)
 //   --free-yaw        the orientation cost on the tilt only, so that the policy may choose its heading to the path
 //   --speed-min V, --speed-max V   the speed range of the velocity task (default 1-4 m/s)
@@ -121,7 +124,7 @@ using FACTORY = whoop::EnvironmentFactory<T, TI, WHOOP_PLATE, TASK>;
 using ENVIRONMENT = FACTORY::ENVIRONMENT;
 
 // the parameters every environment of this run starts from: the compiled nominal ones, changed once in run() by the
-// command-line options (--params, --plate-z, --thrust-cost, --free-yaw, --speed-min, --speed-max) before anything is
+// command-line options (--params, --plate-z, --plate-tilt, --downwash, --thrust-cost, --free-yaw, --speed-min, --speed-max) before anything is
 // sampled. Without those options this is exactly FACTORY::nominal_parameters, so the default runs are unchanged
 ENVIRONMENT::Parameters base_parameters = FACTORY::nominal_parameters;
 
@@ -933,6 +936,10 @@ struct Options{
     std::string params_file;
     bool plate_z_set = false;
     double plate_z = 0;
+    bool plate_tilt_set = false;
+    double plate_tilt_deg = 0;
+    bool downwash_set = false;
+    double downwash = 0;
     T thrust_cost = 0;
     bool free_yaw = false;
     T speed_min = FACTORY::velocity_task.speed_min, speed_max = FACTORY::velocity_task.speed_max;
@@ -968,6 +975,8 @@ Options parse(int argc, char** argv){
         else if(a == "--evaluate") o.evaluate_actor = value(i, a);
         else if(a == "--params") o.params_file = value(i, a);
         else if(a == "--plate-z"){ o.plate_z = std::stod(value(i, a)); o.plate_z_set = true; }
+        else if(a == "--plate-tilt"){ o.plate_tilt_deg = std::stod(value(i, a)); o.plate_tilt_set = true; }
+        else if(a == "--downwash"){ o.downwash = std::stod(value(i, a)); o.downwash_set = true; }
         else if(a == "--thrust-cost") o.thrust_cost = std::stof(value(i, a));
         else if(a == "--free-yaw") o.free_yaw = true;
         else if(a == "--speed-min") o.speed_min = std::stof(value(i, a));
@@ -987,9 +996,11 @@ Options parse(int argc, char** argv){
 void set_base_parameters(const Options& o){
     // the options that change the parameters of every environment of the run; without them base_parameters stays the
     // compiled nominal set
-    if(!o.params_file.empty() || o.plate_z_set){
+    if(!o.params_file.empty() || o.plate_z_set || o.plate_tilt_set || o.downwash_set){
         whoop::runtime::WhoopParams w = o.params_file.empty() ? whoop::runtime::compiled_params() : whoop::runtime::params_from_json_file(o.params_file);
         if(o.plate_z_set) w.plate.centroid[2] = o.plate_z;
+        if(o.plate_tilt_set) whoop::runtime::tilt_plate(w, o.plate_tilt_deg);
+        if(o.downwash_set) w.plate.downwash_factor = o.downwash;
         whoop::runtime::apply<T, TI, WHOOP_PLATE>(w, base_parameters);
     }
     base_parameters.mdp.reward.thrust = o.thrust_cost;
@@ -1010,6 +1021,10 @@ std::string parameters_json(const Options& o){
       << ",\n  \"J_diagonal\": [" << b.dynamics.J[0][0] << ", " << b.dynamics.J[1][1] << ", " << b.dynamics.J[2][2] << "]"
       << ",\n  \"rotor_torque_constant\": " << b.dynamics.rotor_torque_constants[0]
       << ",\n  \"plate_area\": " << b.plate.area << ",\n  \"plate_centroid\": [" << b.plate.centroid[0] << ", " << b.plate.centroid[1] << ", " << b.plate.centroid[2] << "]"
+      << ",\n  \"plate_normal\": [" << b.plate.normal[0] << ", " << b.plate.normal[1] << ", " << b.plate.normal[2] << "]"
+      << ",\n  \"plate_chord_direction\": [" << b.plate.chord_direction[0] << ", " << b.plate.chord_direction[1] << ", " << b.plate.chord_direction[2] << "]"
+      << ",\n  \"plate_edges\": [" << b.plate.chord_x << ", " << b.plate.height_z << "]"
+      << ",\n  \"plate_downwash_factor\": " << b.plate.downwash_factor << ",\n  \"rotor_disc_area\": " << b.plate.rotor_disc_area
       << ",\n  \"plate_coefficients\": {\"CN90\": " << b.plate.CN90 << ", \"Kp_x\": " << b.plate.Kp_x << ", \"Kp_z\": " << b.plate.Kp_z << ", \"CT\": " << b.plate.CT
       << ", \"e0\": " << b.plate.e0 << "}"
       << ",\n  \"body_drag\": [" << b.body_drag[0] << ", " << b.body_drag[1] << ", " << b.body_drag[2] << "]"
@@ -1061,7 +1076,7 @@ int run(int argc, char** argv){
         std::cerr << "usage: " << program << " <out_dir> [seed] [steps] [--eval-interval N] [--no-curriculum] [--no-randomization] [--motor-cuts P]\n"
                   << "       " << program << " <out_dir> --scenario <actor.tar> [--scenario-seeds N] [--speed V] [--cut-time S] [--cut-duration S] [--duration S]\n"
                   << "       " << program << " <out_dir> --evaluate <actor.tar>\n"
-                  << "  any mode: [--params FILE.json] [--plate-z Z] [--thrust-cost W] [--free-yaw] [--speed-min V] [--speed-max V]" << std::endl;
+                  << "  any mode: [--params FILE.json] [--plate-z Z] [--plate-tilt DEG] [--downwash K] [--thrust-cost W] [--free-yaw] [--speed-min V] [--speed-max V]" << std::endl;
         return 1;
     }
     Options options = parse(argc, argv);

@@ -11,8 +11,8 @@ the left camera follows the whoop. If the CSV has a motors_cut column, the cut i
 red rotor discs, the trajectory segment flown without motors and a band on the height plot.
 --frame T --png P writes the frame at time T [s] as a PNG instead of the animation (to check how it reads).
 
-The vehicle (mass, plate size and position) comes from config.json next to the CSV when it is there (so a run with
---plate-z or --params is drawn as it flew), else from params/whoop_nominal.json.
+The vehicle (mass, plate size, position and orientation) comes from config.json next to the CSV when it is there (so a
+run with --plate-z, --plate-tilt or --params is drawn as it flew), else from params/whoop_nominal.json.
 Plate lift = world-z component of the plate force; rotor thrust = sum of the four rotor thrusts; both over the weight of
 the vehicle that flew. Older CSVs without these columns get them recomputed from the rotor states and the plate force.
 """
@@ -53,7 +53,8 @@ def vehicle(csv_path):
     params = json.loads(PARAMS.read_text())
     w, plate = params["whoop"], params["plate"]
     v = dict(rotors=np.array(w["rotor_positions"]), kf=np.array(w["rotor_thrust_coefficients"]), cx=plate["chord_x"],
-             cz=plate["height_z"], centroid=np.array(plate["centroid"], float), mass=None, plate_area=None)
+             cz=plate["height_z"], centroid=np.array(plate["centroid"], float), mass=None, plate_area=None,
+             normal=np.array(plate["normal"], float), e1=np.array(plate.get("chord_direction", [1, 0, 0]), float), downwash=0.0)
     config = Path(csv_path).with_name("config.json")
     if config.exists():
         c = json.loads(config.read_text())
@@ -63,6 +64,11 @@ def vehicle(csv_path):
             v["centroid"] = np.array(c["plate_centroid"], float)
         if "rotor_thrust_coefficients" in c:
             v["kf"] = np.array(c["rotor_thrust_coefficients"], float)
+        if "plate_normal" in c:
+            v["normal"] = np.array(c["plate_normal"], float)
+            v["e1"] = np.array(c["plate_chord_direction"], float)
+            v["cx"], v["cz"] = c["plate_edges"]
+            v["downwash"] = c.get("plate_downwash_factor", 0.0)
     v["nominal_mass"] = w["mass"]
     v["plate_mass"] = plate["added_mass"]
     return v
@@ -115,12 +121,15 @@ def main():
         lift = np.array([(R @ f)[2] for R, f in zip(R_all, force)]) / weight
     yaw_to_path = g("yaw_to_path_deg") if "yaw_to_path_deg" in rows[0] else None
 
-    # the whoop in its body frame: arms to the rotors, rotor discs, and the plate rectangle in the x-z plane
+    # the whoop in its body frame: arms to the rotors, rotor discs, and the plate rectangle: edge c_x along e_1, edge c_z
+    # along e_2 = e_1 x n (the body x-z plane for the vertical plate; docs/plate_model.md)
     rotors = V["rotors"]
     disc = 0.02 * np.c_[np.cos(np.linspace(0, 2 * np.pi, 24)), np.sin(np.linspace(0, 2 * np.pi, 24)), np.zeros(24)]
     cx, cz, c = V["cx"], V["cz"], V["centroid"]
-    plate_corners = c + np.array([[-cx / 2, 0, -cz / 2], [cx / 2, 0, -cz / 2], [cx / 2, 0, cz / 2],
-                                  [-cx / 2, 0, cz / 2], [-cx / 2, 0, -cz / 2]])
+    e1, normal = V["e1"], V["normal"]
+    e2 = np.cross(e1, normal)
+    plate_corners = c + np.array([sx * cx / 2 * e1 + sz * cz / 2 * e2 for sx, sz in ((-1, -1), (1, -1), (1, 1), (-1, 1), (-1, -1))])
+    tilt_deg = float(np.degrees(np.arctan2(normal[2], normal[1])))  # about body x, for the title
 
     fig = plt.figure(figsize=(13, 7.4))
     grid = fig.add_gridspec(2, 3, height_ratios=[3.2, 1.15], width_ratios=[1, 1, 0.34], hspace=0.2, wspace=0.05, left=0.05, right=0.96,
@@ -251,17 +260,30 @@ def main():
             # its vertical part, the lift, on the same scale (teal, upward when the plate carries weight)
             if abs(f_world[2]) > 1e-4 * weight:
                 close.quiver(*start, 0, 0, 0.4 * f_world[2] / weight, color=TEAL, lw=3, arrow_length_ratio=0.3)
-            close.set_title(f"plate force {np.linalg.norm(force[i]) / weight * 100:.0f} % of the weight (orange), "
+            if abs(tilt_deg) < 0.5:
+                plate_name = "vertical plate"
+            elif abs(abs(tilt_deg) - 90) < 0.5:
+                plate_name = "horizontal plate"
+            else:
+                plate_name = f"plate tilted {tilt_deg:.0f}° about body x"
+            if V["downwash"] > 0:
+                plate_name += f", downwash k_w = {V['downwash']:g}"
+            close.set_title(f"{plate_name}: force {np.linalg.norm(force[i]) / weight * 100:.0f} % of the weight (orange), "
                             f"its vertical part (teal)\nroll {angles[i, 0]:.0f}°, pitch {angles[i, 1]:.0f}°", fontsize=10)
         else:
             close.set_title(f"no plate\nroll {angles[i, 0]:.0f}°, pitch {angles[i, 1]:.0f}°", fontsize=10)
         if off:
             close.text2D(0.5, 0.9, "MOTORS OFF", transform=close.transAxes, ha="center", va="center", fontsize=18,
                          fontweight="bold", color="white", bbox=dict(boxstyle="round,pad=0.3", fc=RED, ec=RED))
-        # the close-up camera looks at the plate's face, 60 deg off its normal and from slightly above, whatever the
-        # heading (the default view sees a crabbed plate edge-on)
-        normal_world = R @ np.array([0.0, 1.0, 0.0])
-        close.view_init(elev=22, azim=np.degrees(np.arctan2(normal_world[1], normal_world[0])) + 60)
+        # the close-up camera follows the body whatever the heading (the default view sees a crabbed plate edge-on).
+        # Vertical plate: 60 deg off its normal (body y) and from slightly above. Tilted plate: nearly along the chord
+        # (body x, 18 deg off), low, so that the plate shows as a line at its tilt to the rotor discs
+        if abs(tilt_deg) > 0.5:
+            chord_world = R @ e1
+            close.view_init(elev=8, azim=np.degrees(np.arctan2(chord_world[1], chord_world[0])) + 180 + 18)
+        else:
+            side_world = R @ np.array([0.0, 1.0, 0.0])
+            close.view_init(elev=22, azim=np.degrees(np.arctan2(side_world[1], side_world[0])) + 60)
         h = 0.12
         close.set_xlim(p[0] - h, p[0] + h)
         close.set_ylim(p[1] - h, p[1] + h)

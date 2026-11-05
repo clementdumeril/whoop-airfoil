@@ -45,7 +45,16 @@ namespace whoop{
             }
             PlateAerodynamics<T> aero;
             if(plate){
-                plate_aerodynamics(device, params.plate, state.orientation, state.linear_velocity, state.angular_velocity, aero);
+                // the total rotor thrust along body z, only for the downwash on the plate (k_w > 0); action holds
+                // the rotor states here (L2F passes state.rpm), from which L2F computes the same thrusts
+                T rotor_thrust = 0;
+                if(params.plate.downwash_factor > 0){
+                    for(TI i = 0; i < 4; i++){
+                        const auto& c = params.dynamics.rotor_thrust_coefficients[i];
+                        rotor_thrust += (c[0] + c[1] * action[i] + c[2] * action[i] * action[i]) * params.dynamics.rotor_thrust_directions[i][2];
+                    }
+                }
+                plate_aerodynamics(device, params.plate, state.orientation, state.linear_velocity, state.angular_velocity, rotor_thrust, aero);
                 for(TI i = 0; i < 3; i++){
                     force_body[i] += aero.force[i];
                 }

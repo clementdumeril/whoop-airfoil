@@ -14,7 +14,8 @@
     "rotor_time_constant_falling": 0.1,
     "J": [[1.2e-05, 0, 0], [0, 1.2e-05, 0], [0, 0, 2.2e-05]],
     "_body_drag": "nominal [0.008, 0.008, 0.004] x 1.30",
-    "body_drag": [0.0104, 0.0104, 0.0052]
+    "body_drag": [0.0104, 0.0104, 0.0052],
+    "rotor_radius": 0.02
   },
   "plate": {
     "added_mass": 0.0007,
@@ -22,6 +23,7 @@
     "height_z": 0.065,
     "area": 0.0078,
     "normal": [0, 1, 0],
+    "chord_direction": [1, 0, 0],
     "centroid": [0, 0, -0.04],
     "_coefficients": "C_N90 nominal 1.15 x 1.20, K_px nominal 0.84 x 0.85; the others nominal",
     "CN90": 1.38,

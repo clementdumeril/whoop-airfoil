@@ -9,11 +9,15 @@ Besides copying the values, the script derives what L2F needs and the JSON does 
   - J_inv, the inverse of the inertia matrix (L2F stores both);
   - the hover command u_h with c0 + c1 u_h + c2 u_h^2 = m g / 4 (L2F's hovering_throttle_relative, used by the reward);
   - the mass and inertia with the plate on [assumption]: plate.added_mass is taken as the mass of the EPP sheet
-    (3 mm x 0.0078 m^2 x about 30 kg/m^3 = 0.7 g), the sheet as a thin rectangle c_x x c_z in the body x-z plane with
-    its centroid at plate.centroid relative to the centre of mass of the whole vehicle, and the whoop's own J taken
-    about its own centre of mass (parallel-axis terms for both parts).
-It also checks the body drag (non-negative) and the randomization ranges (r in [0, 1), so that every factor stays
-positive).
+    (3 mm x 0.0078 m^2 x about 30 kg/m^3 = 0.7 g), the sheet as a thin rectangle with its edge c_1 (chord_x) along
+    plate.chord_direction e_1 and its edge c_2 (height_z) along e_2 = e_1 x n, with its centroid at plate.centroid
+    relative to the centre of mass of the whole vehicle, and the whoop's own J taken about its own centre of mass
+    (parallel-axis terms for both parts). The nominal plate is vertical (n = y, e_1 = x, e_2 = z);
+  - the total rotor disc area A = 4 pi R^2 for the crude downwash term (only used when plate.downwash_factor > 0).
+It also checks the plate frame (unit n and e_1, n . e_1 = 0), the downwash option (k_w >= 0; k_w > 0 needs
+whoop.rotor_radius and the plate centroid below the rotor discs), the body drag (non-negative) and the randomization
+ranges (r in [0, 1), so that every factor stays positive).
+plate.chord_direction and whoop.rotor_radius are optional: without them e_1 = x and no downwash is possible.
 """
 import json
 import math
@@ -57,6 +61,17 @@ def parallel_axis(mass, r):
     return [[mass * ((r2 if i == j else 0) - r[i] * r[j]) for j in range(3)] for i in range(3)]
 
 
+def sheet_inertia(mass, c1, c2, e1, e2):
+    # thin rectangle about its own centroid: m / 12 (c_1^2 (I - e_1 e_1^T) + c_2^2 (I - e_2 e_2^T)); for e_1 = x and
+    # e_2 = z this is m / 12 diag(c_2^2, c_1^2 + c_2^2, c_1^2), with exact zeros off the diagonal
+    return [[mass * (c1 ** 2 * ((1 if i == j else 0) - e1[i] * e1[j]) + c2 ** 2 * ((1 if i == j else 0) - e2[i] * e2[j])) / 12
+             for j in range(3)] for i in range(3)]
+
+
+def cross3(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
 def add3(a, b):
     return [[a[i][j] + b[i][j] for j in range(3)] for i in range(3)]
 
@@ -75,15 +90,27 @@ def main():
     w, plate = p["whoop"], p["plate"]
 
     n = plate["normal"]
+    e1 = plate.get("chord_direction", [1, 0, 0])
     if abs(math.sqrt(sum(x * x for x in n)) - 1) > 1e-9:
         fail("plate normal is not a unit vector")
-    if abs(n[0]) > 1e-9:
-        # docs/plate_model.md measures the in-plane wind direction with v_t,x: the horizontal edge must be body x
-        fail("the plate must contain the body x axis (normal with zero x component)")
-    if plate["downwash_factor"] != 0:
-        fail("downwash_factor != 0 is not implemented (docs/plate_model.md: k_w = 0 for now)")
+    if abs(math.sqrt(sum(x * x for x in e1)) - 1) > 1e-9:
+        fail("plate chord_direction is not a unit vector")
+    if abs(sum(a * b for a, b in zip(n, e1))) > 1e-9:
+        # docs/plate_model.md: e_1 lies in the plate, the in-plane wind direction is measured along it
+        fail("plate chord_direction must lie in the plate (perpendicular to the normal)")
     if any(len(r) != 3 for r in w["rotor_positions"]) or len(w["rotor_positions"]) != 4:
         fail("expected 4 rotors")
+    k_w = plate["downwash_factor"]
+    rotor_radius = w.get("rotor_radius", 0)
+    if k_w < 0:
+        fail("downwash_factor must be >= 0")
+    if k_w > 0:
+        if not rotor_radius > 0:
+            fail("downwash_factor > 0 needs whoop.rotor_radius")
+        if not plate["centroid"][2] < min(r[2] for r in w["rotor_positions"]):
+            # the term puts the plate in the rotors' wake: it must hang below the discs
+            fail("downwash_factor > 0 needs the plate centroid below the rotor discs")
+    disc_area = 4 * math.pi * rotor_radius ** 2
     body_drag = w["body_drag"]
     if len(body_drag) != 3 or any(d < 0 for d in body_drag):
         fail("body_drag must be 3 non-negative values (kg/s, body x, y, z)")
@@ -100,9 +127,10 @@ def main():
     m_total = m_whoop + m_plate
     c_x, c_z = plate["chord_x"], plate["height_z"]
     r_c = plate["centroid"]
-    # thin sheet about its own centroid (x-z plane: no thickness along y), then moved to the vehicle centre of mass;
+    # thin sheet about its own centroid (no thickness along its normal), then moved to the vehicle centre of mass;
     # the whoop's own centre of mass sits at -m_plate / m_whoop * r_c from the combined one
-    J_sheet = [[m_plate * c_z ** 2 / 12, 0, 0], [0, m_plate * (c_x ** 2 + c_z ** 2) / 12, 0], [0, 0, m_plate * c_x ** 2 / 12]]
+    e2 = cross3(e1, n)
+    J_sheet = sheet_inertia(m_plate, c_x, c_z, e1, e2)
     r_whoop = [-m_plate / m_whoop * x for x in r_c]
     J_total = add3(add3(J, parallel_axis(m_whoop, r_whoop)), add3(J_sheet, parallel_axis(m_plate, r_c)))
 
@@ -134,13 +162,16 @@ def main():
     out.append("        constexpr double chord_x = %s;" % cpp(c_x))
     out.append("        constexpr double height_z = %s;" % cpp(c_z))
     out.append("        constexpr double normal[3] = %s;" % cpp(n))
+    out.append("        constexpr double chord_direction[3] = %s;  // e_1, along the edge chord_x" % cpp(e1))
     out.append("        constexpr double centroid[3] = %s;" % cpp(r_c))
     out.append("        constexpr double CN90 = %s;" % cpp(plate["CN90"]))
     out.append("        constexpr double Kp_x = %s;" % cpp(plate["Kp_x"]))
     out.append("        constexpr double Kp_z = %s;" % cpp(plate["Kp_z"]))
     out.append("        constexpr double CT = %s;" % cpp(plate["CT"]))
     out.append("        constexpr double e0 = %s;" % cpp(plate["e0"]))
-    out.append("        constexpr double downwash_factor = %s;" % cpp(plate["downwash_factor"]))
+    out.append("        constexpr double downwash_factor = %s;" % cpp(k_w))
+    out.append("        constexpr double rotor_radius = %s;  // whoop.rotor_radius, 0 if not given" % cpp(rotor_radius))
+    out.append("        constexpr double rotor_disc_area = %s;  // 4 pi R^2" % cpp(disc_area))
     out.append("        constexpr double air_density = %s;" % cpp(plate["air_density"]))
     out.append("        constexpr double added_mass = %s;" % cpp(m_plate))
     out.append("        // the whole vehicle with the plate on [assumption, see the script]")

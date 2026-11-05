@@ -10,7 +10,7 @@ the RLtools checkout itself is not modified.
 | file | what it does |
 |---|---|
 | `sim/tools/generate_params.py` | reads `params/whoop_nominal.json` and writes `whoop/params.h` into the build directory at build time. It checks the inputs and derives J⁻¹, the hover command and the mass and inertia with the plate |
-| `sim/include/whoop/plate.h` | `plate_aerodynamics`: the equations of `docs/plate_model.md`, line by line |
+| `sim/include/whoop/plate.h` | `plate_aerodynamics`: the equations of `docs/plate_model.md`, line by line, for a plate of any orientation (normal n, chord direction e1), with the optional crude downwash term |
 | `sim/include/whoop/body_drag.h` | `body_drag_force`: the linear body drag of `docs/plate_model.md` |
 | `sim/include/whoop/environment.h` | parameter, reward and task types, and `EnvironmentFactory<T, TI, PLATE, TASK>`: the L2F environment type with the whoop numbers, states and observations |
 | `sim/include/whoop/operations.h` | the few L2F operations that change for the whoop (see "Design" below) |
@@ -19,7 +19,7 @@ the RLtools checkout itself is not modified.
 | `sim/include/whoop/params_runtime.h` | reads a parameter JSON at run time (`--params`, `--plate-z`) and derives J⁻¹, the hover command and the mass and inertia with the plate exactly as `generate_params.py` does |
 | `sim/include/whoop/metrics.h` | what the evaluation measures: plate lift (world z of the plate force), plate force and total rotor thrust, over the weight |
 | `sim/tools/animate_flight.py` | a `flights.csv` as a GIF: trajectory, close-up of the whoop and plate, gauges of rotor thrust, plate lift and angle of attack, height and forces against time |
-| `sim/tools/plate_trim.py` | the least rotor thrust of steady straight flight that the plate model allows, per speed (a bound for the policies) |
+| `sim/tools/plate_trim.py` | the least rotor thrust of steady straight flight that the plate model allows, per speed, plate tilt and downwash factor (a bound for the policies), and its plot |
 | `sim/tools/plot_plate_lift.py` | rotor thrust and plate lift against speed from the speed sweeps of several runs |
 | `sim/CMakeLists.txt` | the build: 1 test target and 8 training targets |
 | `sim/slurm/setup.sh`, `build.slurm`, `train.slurm` | Savio: configure, build and test, then a 40-run array |
@@ -166,6 +166,10 @@ cmake --build <build>
     identified parameters and to fly a policy on the "true" drone.
   - `--plate-z Z`: the plate centroid height relative to the centre of mass [m] (nominal −0.04); the inertia with the
     plate is recomputed.
+  - `--plate-tilt DEG`: the plate tilted by DEG about body x, normal (0, cos, sin), chord along x (0 = the nominal
+    vertical plate, 90 = horizontal); the inertia with the plate is recomputed (`docs/plate_model.md`).
+  - `--downwash K`: the crude propeller downwash on the plate, k_w = K (nominal 0; `docs/plate_model.md`). Refused
+    unless the plate centroid is below the rotor discs.
   - `--thrust-cost W`: a rotor power cost in the reward, `W (mean_i (f_i / f_hover)^1.5 − 1)` inside the paper's
     bracket, f_i the commanded rotor thrust (momentum theory: induced power ∝ f^1.5). It is zero at the hover command,
     so the reward of a perfect flight stays at the constant. The curriculum recomputes it from the stored action.
@@ -197,12 +201,12 @@ All three scripts run from `sim/`:
 
 They use account `ic_piml`, partition `savio4_htc` and the Fixed-Wing venv.
 
-## Test results (`whoop_test`, laptop, MSVC 19.44: 35/35 pass)
+## Test results (`whoop_test`, laptop, MSVC 19.44: 43/43 pass)
 
 | check | result |
 |---|---|
 | pure wind of 3 m/s on the plate normal | F_y = −0.04832 N = the formula to 1e-12 (16% of the weight). τ = r_c × F |
-| oblique wind with the whoop moving, rotated and rolling | F and τ equal an independent transcription of `docs/plate_model.md` to 7e-18 N |
+| oblique wind with the whoop moving, rotated and rolling | F and τ equal an independent transcription of `docs/plate_model.md` to 7e-18 N (the transcription now takes c² along e1, the general frame) |
 | plate in the equations of motion (body drag on in both cases, same wind) | dv/dt changes by exactly R F / m (to 2e-16) and dω/dt by J⁻¹ τ; dp/dt and dq/dt do not change |
 | body drag at 3 m/s forward, level | F_x = −0.024 N = −d_x v (8.0% of the weight) |
 | body drag of a rotated, moving whoop in wind (plate off) | F = −diag(d) Rᵀ(v − wind) to 2e-18 N; dv/dt changes by R F / m (to 2e-16); dω/dt, dp/dt, dq/dt do not change |
@@ -223,6 +227,12 @@ They use account `ic_piml`, partition `savio4_htc` and the Fixed-Wing venv.
 | `--plate-z 0` | J = J_whoop + the sheet's own inertia exactly (J_xx 1.22e-5 instead of 1.34e-5); a side wind gives no roll moment |
 | power cost | 0 at the hover command; (f/f_hover)^1.5 − 1 averaged over the rotors (full command: 6.95); in the reward −scale × W × cost |
 | plate lift metric | level, face-on at 3 m/s: lift exactly 0 (force 16% of the weight, horizontal); banked 20°: 5.35% = (R F)_z / m g of the independent transcription to 1e-12; rotor thrust at hover = 1 |
+| vertical plate, general plate frame against the code before it (verbatim copy in the test) | 100 000 random states, winds and coefficients, float and double: **0 bits differ** |
+| horizontal plate (θ = 90°), level, 4 m/s forward and descending at α = 10° | F_z = ½ ρ S C_N(α) V² up (C_N with K_px), friction along −x, to 1e-12 N; lift 3.5% of the weight |
+| plate tilted 30, 45, 60°, level, flying toward body −y at 4 m/s | α = 90° − θ, F = ½ ρ S C_N V² n − friction exactly; F_z = 13.8, 18.6, 19.8% of the weight |
+| tilted plates (30, 45, 90°), oblique wind, moving and rolling | F and τ equal the independent transcription to 7e-18 N |
+| inertia of a rotated plate (45°, 90°) | J_total(θ) − J_total(0) = R_x J_sheet R_xᵀ − J_sheet to 3e-16 relative; θ = 0 gives the compiled J |
+| downwash k_w = 1 | v_i = sqrt(T / 2ρA) = 5.0 m/s at hover and v_i²(v_i² + V²) = v_h⁴ at 4 m/s; a horizontal plate under hovering rotors is pushed down by 45% of the weight (= the transcription); the dynamics take T from the rotor states; a plate above the discs is refused |
 
 ## Smoke training (laptop, one seed, 300k steps each, SAC unless noted)
 
@@ -413,7 +423,8 @@ So the best is to fly sideways: body x across the path, the plate face-on, banke
 any quadrotor banks to fly sideways), which tilts the plate's normal force up. The 10–20 % of the weight expected
 from the plate at 3–4 m/s is not reachable in steady flight with this geometry: 4–11 % of lift, for 2–5 % less
 thrust. The plate itself weighs 0.7 g (2.3 % of the whoop), so in newtons the plate whoop pushes less than the bare
-whoop only above about 3.2 m/s. [assumption: quasi-steady plate model, no propeller downwash on the plate]
+whoop only above about 3.2 m/s. [assumption: quasi-steady plate model, no propeller downwash on the plate] A plate
+tilted about body x carries weight at first order instead: see "Tilted and horizontal plates" below.
 
 **What the policies do.** Velocity task at 2–4 m/s (`--speed-min 2`), SAC, 1M steps (3.3–3.9 min each), one seed
 each, randomization on; thrust cost W = 2 where noted. W = 2 is small: at 4 m/s the best attitude saves 2.8 % of
@@ -453,6 +464,101 @@ What this shows:
   `anim/lift_noplate.gif` (no-plate policy, same reference: 103.1 % thrust; that flight oscillates in pitch, 0.41 m/s
   velocity RMSE; its steadiest heading at 4 m/s takes 99.7 %).
 
+## Tilted and horizontal plates (`--plate-tilt`, `--downwash`)
+
+The vertical plate's force is perpendicular to the rotor thrust, so its saving is second order (above). A plate
+tilted by θ about body x (normal (0, cos θ, sin θ), chord still along x, same edges and mount 4 cm below the centre of
+mass) is a wing set at 90° − θ to the rotor discs: flying toward body −y, the air meets its lower face and its normal
+force has an upward part, first order in the force. The horizontal plate (θ = 90°) is the limit where the normal force
+is along the thrust axis. Since the thrust axis must lean into the path to overcome drag, the air then meets the plate
+from above and the normal force pushes down: in steady level flight a horizontal plate parallel to the rotor discs can
+only cost thrust. (This is the opposite of the expected 15 % of the weight; the 15 % would need the plate set at an
+incidence to the rotor discs, not parallel to them.)
+
+**Steady-flight bound** (`plate_trim.py --tilts 0,30,45,60,90 --downwash 0,1`; least rotor thrust in % of the
+vehicle's own weight, 30.7 g; the bare whoop needs 100.0 %, 294 mN, at every speed here). Figure
+[`sim/figures/plate_tilt_trim.png`](../sim/figures/plate_tilt_trim.png).
+
+| θ | k_w = 0, 3 m/s: thrust, lift | k_w = 0, 4 m/s: thrust, lift | attitude at 4 m/s (yaw to path, roll, α) | k_w = 1, 3 m/s | k_w = 1, 4 m/s |
+|---|---|---|---|---|---|
+| 0° (vertical) | 98.2 %, 3.7 % | 94.7 %, 10.6 % | 90°, 22°, 68° | 85.1 %, 28.7 % * | 74.4 %, 46.0 % * |
+| 30° | 91.2 %, 10.1 % | 83.5 %, 19.4 % | 90°, 19°, 41° | 99.2 %, 1.0 % | 83.2 %, 81.8 % * (roll 78°, rotors out of range) |
+| 45° | **89.5 %, 11.2 %** | **81.9 %, 19.7 %** | 90°, 16°, 29° | 117.6 %, −16.8 % | 108.6 %, −8.7 % |
+| 60° | 90.3 %, 10.0 % | 84.4 %, 16.2 % | 90°, 11°, 19° | 141.9 %, −39.3 % | 138.1 %, −36.7 % |
+| 90° (horizontal) | 101.0 %, −0.9 % | 102.3 %, −2.2 % | 0°, pitch 6°, α 6° | 156.4 %, −56.2 % | 160.3 %, −59.8 % |
+
+(* not credible, see below.) Yaw to path +90° is flight toward body −y, the plate's lifting side.
+
+- Without downwash, 30–60° all give a first-order saving: 9–11 % less thrust than their own weight at 3 m/s,
+  16–18 % at 4 m/s, against 2 % and 5 % for the vertical plate. 45° is the best of those tried; the curve is flat between 30° and 60°. The whoop
+  flies sideways, banked 16° at 4 m/s, the plate at α = 29°.
+- **Downwash is where this model is weakest.** A plate tilted or horizontal under the rotors sits in their wake,
+  which at hover moves at v_i = 5.0 m/s (momentum theory, 40 mm props), faster than the flight. With the crude term at
+  k_w = 1 (the whole plate in that wake, `docs/plate_model.md`), the wake pushes the 45–90° plates down by 9–60 % of the
+  weight and the saving turns into a loss of 9–60 %. With k_w = 1 the vertical and 30° plates appear to gain instead:
+  the wake runs along them, the term raises their dynamic pressure and lets them turn the wake sideways while the rotor
+  thrust is kept as if the plate were not there. That breaks the wake's momentum balance by about as much as the
+  second-order saving it produces, so those rows are not a bound. k_w = 0 and 1 are the two ends of a crude range: the
+  real plate is partly outside the four slipstreams, the wake skews back in forward flight, and the rotors' thrust
+  changes when the plate blocks their wake. A horizontal or steeply tilted plate under the props is the configuration
+  where neglecting the downwash matters most; it needs a measurement (thrust with and without the plate on a stand, or
+  in flight) before any of the k_w = 0 savings above can be trusted.
+
+**Trained policies** (velocity task 2–4 m/s, SAC, 1M steps (2.8–3.1 min), seed 0, randomization on, no downwash; the
+vertical-plate and no-plate rows are the policies of the section above). Speed sweep means over the 8 headings
+(t = 2–5 s); the best flight is the heading with the least thrust:
+
+| policy | test success, pos. RMSE | 3 m/s: thrust, lift | 4 m/s: thrust, lift, \|roll\|, α | best 4 m/s flight: thrust, lift | 4 m/s, the 3 headings on the lifting side |
+|---|---|---|---|---|---|
+| no plate | 99 %, 0.25 m | 100.1 %, – | 100.5 %, –, 5°, – | 99.7 % | – |
+| vertical (θ = 0) | 99 %, 0.26 m | 98.8 %, 2.2 % | 96.1 %, 8.1 %, 19°, 58° | 94.6 %, 10.2 % | – |
+| θ = 45° | 99 %, 0.16 m | 98.9 %, 2.2 % | 100.6 %, 3.9 %, 15°, 36° | **82.5 %, 19.6 %** | 82.5–84.5 % |
+| θ = 45°, free yaw | 69 %, 0.40 m | 99.7 %, 0.7 % | 105.6 %, −3.0 %, 14°, 42°; 2 of 8 failed | 83.5 %, 18.6 % | 83.5 % (2 of 3 failed) |
+| θ = 30°, free yaw | 93 %, 0.20 m | 100.8 %, 0.5 % | 101.6 %, 2.8 %, 18°, 58° | 83.8 %, 18.7 % | 83.8–90.8 % |
+| θ = 90° (horizontal) | 100 %, 0.20 m | 101.9 %, −1.9 % | 104.7 %, −4.6 %, 4°, 7° | 102.5 %, −2.5 % | – |
+| steady-flight bound, θ = 45° | | 89.5 %, 11.2 % | 81.9 %, 19.7 %, 16°, 29° | | |
+
+![trained policies against the steady-flight bounds](../sim/figures/plate_tilt_policies.png)
+
+- **In the headings where the lifting side faces the path, the 45° policy flies on the bound**: 82.5 % of its weight
+  in rotor thrust at 4 m/s with the plate carrying 19.6 % (bound 81.9 %, 19.7 %), 89.5 % at 3 m/s (bound 89.5 %),
+  the best flight crabbed 88°, banked 15°, α = 30°. In newtons that is 248 mN against 296 mN for the bare whoop
+  (16 % less), where the vertical plate's best flight saves 3.7 % (285 mN).
+- **Averaged over all headings there is no saving.** The policies keep their yaw near world x, as the orientation cost
+  asks (and, with `--free-yaw`, still near a fixed heading). In the headings where the path is on the plate's other
+  side (body +y), the plate pushes down: 112.7–116.1 % of the weight at 4 m/s for θ = 45°. The mean over 8 headings is
+  100.6 % (vertical plate 96.1 %). A tilted plate pays only if the whoop turns its lifting side into the path, which
+  none of these policies learned: `--free-yaw` allowed it, but the two free-yaw runs kept a fixed heading and tracked
+  worse (69 % and 93 % success). A reward or a task that makes the heading follow the path was not tried.
+- **The horizontal plate costs thrust, as the bound says**: 104.7 % at 4 m/s (bound 102.3 %), the plate pushing down
+  by 4.6 % of the weight.
+- **With the downwash term the tilted policies stop working**: flown with `--downwash 1` (trained without it), the 45°
+  policy succeeds in 75 % of the test flights and needs 116 % thrust at 4 m/s (best heading 110 %); the horizontal
+  plate needs 164–186 % and succeeds in 72 % (`eval_kw1_*` runs).
+
+**Motor cuts** (3 m/s along world x, cut at 1.5 s, 5 seeds; flips = tilted past 150°; the vertical and no-plate rows
+are the section above's policies):
+
+| policy | cut 0.3 s | cut 0.4 s | plate lift during the cut |
+|---|---|---|---|
+| no plate | back 5/5, 0.51–0.59 m | back 3/5, 0.96–1.23 m; flips 1/5 | – |
+| vertical | flips 5/5 | flips 5/5 | 3.4–5.6 % |
+| θ = 45° | flips 5/5 | flips 5/5 | 6.9–8.3 % |
+| θ = 45°, free yaw | back 1/5 (0.61 m); flips 4/5 | flips 4/5, none back | −0.9–7.1 % |
+| θ = 30°, free yaw | flips 5/5 | flips 5/5 | 5.3–8.0 % |
+| θ = 90° (horizontal) | **back 5/5, 0.57–1.22 m, tilt ≤ 92°** | flips 4/5; 1/5 fall stopped (2.9 m) but not back | 5.1–7.9 % |
+
+- The horizontal plate is the only plate that comes back from a 0.3 s cut (5 of 5, the vertical plate flips in all
+  5), but it loses more height than the whoop without a plate (0.57–1.22 m against 0.51–0.59 m) and flips at 0.4 s. Its
+  upward force during the cut is 5–8 % of the weight: it does not hold the whoop up or slow the fall in a way the
+  altitude shows. The tilted plates flip like the vertical one.
+
+GIFs: `anim/lift_tilt45.gif` (θ = 45°, sweep flight 37: 4 m/s, heading 225°; 82.5 % thrust, 19.6 % lift; the close-up
+looks almost along the chord, so the plate shows as a line at 45° to the rotor discs), `anim/motor_cut_tilt45_0.3s.gif`
+(θ = 45°, 0.3 s cut, seed 0: rolls over) and `anim/motor_cut_horizontal_0.3s.gif` (horizontal plate, 0.3 s cut, seed 0:
+back on the line). Not tried: other mounts or chord directions for the tilted plate (for example a plate pitched about
+body y so that forward flight is the lifting direction), training with the downwash term, more seeds.
+
 ## Assumptions
 
 All marked `[assumption]` in the code as well:
@@ -471,8 +577,10 @@ All marked `[assumption]` in the code as well:
 - **Plate model.**
   - Quasi-steady, exactly `docs/plate_model.md` with ε = 1e-6.
   - No wind (`plate.wind` = 0, but the parameter exists).
-  - No propeller downwash: k_w = 0. The generator refuses k_w ≠ 0, since v_i is not defined yet.
-  - The plate's horizontal edge is body x. The generator checks that the normal has no x component.
+  - No propeller downwash by default (k_w = 0). `--downwash K` adds the crude term of `docs/plate_model.md`: the
+    whole plate in the rotors' momentum-theory induced velocity, the rotor thrust unchanged by the plate.
+  - The plate's frame (n, e1) is free; the generator checks that both are unit vectors and perpendicular. All plates
+    tried here keep the chord along body x.
 - **Body drag.** Linear, at the centre of mass, d = (0.008, 0.008, 0.004) kg/s: the truth of the synthetic flights of
   `sysid/`, not a measurement. L2F has none. It sees the same wind as the plate (`plate.wind`, zero).
 - **Disturbances.** The random force and torque use L2F's ratios (m g/20, m g/10000) with the whoop's mass. The
@@ -515,8 +623,14 @@ All marked `[assumption]` in the code as well:
   - The synthetic manoeuvre controller of `sysid/` needed stiffer attitude gains for the example truth's plate flight;
     real flights are flown by a pilot or Betaflight, not by it.
 - **Plate lift.** Measured in the quasi-steady model only. The bound of `plate_trim.py` is for steady straight flight
-  with pure body-z thrust; propeller downwash on the plate (k_w), which would change the face-on force, is not in the
-  model.
+  with pure body-z thrust. The downwash term (k_w) is crude and off in training: for a tilted or horizontal plate under
+  the rotors it changes the result from a 18 % saving to a 9–60 % loss, so the tilted-plate savings are not verified
+  until the plate's effect on the rotors is measured.
+- **Tilted plates.** One seed per policy; the free-yaw runs tracked worse than the yaw-locked one. The tilted-plate
+  policies were not trained with motor cuts. The general plate frame is bit-identical to the previous code in the
+  test build (no fast math); the training build (`/fp:fast`) is not: an old policy re-evaluated with it gives the same
+  success and RMSE (97 %, 0.212 m) and plate forces equal to 6 significant digits at first, which then drift apart in
+  the chaotic flights.
 - **Training reference at the end of an episode.** The state after the last step of an episode sees L2F's reference
   turned back (velocity of the opposite sign). The evaluation now corrects for it, but the critic still bootstraps
   from that last observation in training. It affects one transition per 500.

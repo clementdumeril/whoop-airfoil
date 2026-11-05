@@ -1,13 +1,15 @@
 """Rotor thrust and plate lift against speed, from the speed sweep of several runs (evaluation.json, "speed_sweep").
 
-python plot_plate_lift.py <out.png> <label>=<run_dir> [<label>=<run_dir> ...] [--trim trim.json] [--title TEXT]
+python plot_plate_lift.py <out.png> <label>=<run_dir> [<label>=<run_dir> ...] [--trim trim.json[:KEY]] ... [--title TEXT]
 
 Three panels: the total rotor thrust in % of the vehicle's own weight; the same thrust in % of the weight of the whoop
 without the plate (30 g), which is what the motors push in absolute terms (the plate itself weighs 0.7 g); and the
 vertical (world z) plate force in % of the weight. Every point is the mean over the 8 headings of the sweep and over
 t = 2-5 s of each flight (whoop_train_* evaluation). A run whose label contains "no plate" is drawn dashed.
 --trim adds the least-thrust steady flight of sim/tools/plate_trim.py (--json output) as a black line: what the model
-allows at best, for a whoop that may choose its attitude freely.
+allows at best, for a whoop that may choose its attitude freely. KEY picks the plate case of the file (for example
+tilt45_kw0; default: "plate" in files of the earlier format, else tilt0_kw0, the vertical plate without downwash);
+--trim may be given several times, and the no-plate trim is drawn once.
 """
 import argparse
 import json
@@ -26,7 +28,7 @@ def main():
     a = argparse.ArgumentParser()
     a.add_argument("out")
     a.add_argument("runs", nargs="+")
-    a.add_argument("--trim", default=None)
+    a.add_argument("--trim", action="append", default=[])
     a.add_argument("--title", default="")
     args = a.parse_args()
     fig, ax = plt.subplots(1, 3, figsize=(14, 4.2))
@@ -40,16 +42,30 @@ def main():
         ax[0].plot(v, [100 * r["rotor_thrust_to_weight"] for r in rows], **style)
         ax[1].plot(v, [100 * r["rotor_thrust_to_weight"] * cfg["mass"] / NOPLATE_MASS for r in rows], **style)
         ax[2].plot(v, [100 * r["plate_lift_to_weight"] for r in rows], **style)
-    if args.trim:
-        trim = json.loads(Path(args.trim).read_text())
-        for name, ls in (("plate", "-"), ("noplate", ":")):
+    trim_styles = ["-", "-.", (0, (6, 3)), (0, (2, 2, 8, 2))]
+    for k, item in enumerate(args.trim):
+        # FILE[:KEY]; a Windows drive letter ("C:\...") is not a key
+        path, _, key = item.rpartition(":")
+        if not path or any(c in key for c in "\\/."):
+            path, key = item, ""
+        trim = json.loads(Path(path).read_text())
+        key = key or ("plate" if "plate" in trim else "tilt0_kw0")
+        cases = [(key, trim_styles[k % len(trim_styles)])] + ([("noplate", ":")] if k == 0 else [])
+        for name, ls in cases:
             rows = trim[name]
             v = [r["speed"] for r in rows]
-            mass_ratio = (NOPLATE_MASS + (0.0007 if name == "plate" else 0)) / NOPLATE_MASS  # [assumption: nominal masses]
-            lab = "least possible, " + ("plate" if name == "plate" else "no plate") + " (steady trim)"
+            plate = name != "noplate"
+            mass_ratio = (NOPLATE_MASS + (0.0007 if plate else 0)) / NOPLATE_MASS  # [assumption: nominal masses]
+            if not plate:
+                what = "no plate"
+            elif "tilt_deg" in rows[0]:
+                what = "plate tilted %g deg" % rows[0]["tilt_deg"] + ("" if rows[0]["downwash_factor"] == 0 else ", k_w = %g" % rows[0]["downwash_factor"])
+            else:
+                what = "plate"
+            lab = "least possible, " + what + " (steady trim)"
             ax[0].plot(v, [100 * r["thrust_to_weight"] for r in rows], color="black", lw=1, ls=ls, label=lab)
             ax[1].plot(v, [100 * r["thrust_to_weight"] * mass_ratio for r in rows], color="black", lw=1, ls=ls, label=lab)
-            if name == "plate":
+            if plate:
                 ax[2].plot(v, [100 * r["plate_lift_to_weight"] for r in rows], color="black", lw=1, ls=ls, label=lab)
     ax[0].set_ylabel("rotor thrust (% of own weight)")
     ax[1].set_ylabel("rotor thrust (% of the 30 g whoop's weight)")

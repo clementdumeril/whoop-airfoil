@@ -1,4 +1,4 @@
-// Whoop and plate parameters read from a JSON file at run time (train.cpp --params, --plate-z).
+// Whoop and plate parameters read from a JSON file at run time (train.cpp --params, --plate-z, --plate-tilt, --downwash).
 //
 // The default build takes its numbers from whoop/params.h, which tools/generate_params.py writes from
 // params/whoop_nominal.json at build time. To fly or train another vehicle (for example the "true" drone of a
@@ -13,6 +13,7 @@
 
 #include <whoop/environment.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -50,6 +51,7 @@ namespace whoop::runtime{
             return number;
         }
         size_t size() const{ return type == Type::ARRAY ? array.size() : 0; }
+        bool has(const std::string& key) const{ return type == Type::OBJECT && object.count(key) > 0; }
     };
 
     class JsonParser{
@@ -152,9 +154,11 @@ namespace whoop::runtime{
         double mass, gravity[3], rotor_positions[4][3], rotor_thrust_directions[4][3], rotor_torque_directions[4][3];
         double rotor_thrust_coefficients[3], rotor_torque_constant, rotor_time_constant_rising, rotor_time_constant_falling;
         double J[3][3], body_drag[3];
+        double rotor_radius;  // optional in the JSON (0 if absent); only the downwash term uses it
         double randomization_plate, randomization_body_drag;
         struct{
-            double area, chord_x, height_z, normal[3], centroid[3], CN90, Kp_x, Kp_z, CT, e0, downwash_factor, air_density, added_mass;
+            // chord_direction: optional in the JSON, (1, 0, 0) if absent
+            double area, chord_x, height_z, normal[3], chord_direction[3], centroid[3], CN90, Kp_x, Kp_z, CT, e0, downwash_factor, air_density, added_mass;
         } plate;
     };
 
@@ -167,6 +171,7 @@ namespace whoop::runtime{
             p.rotor_thrust_coefficients[j] = params::rotor_thrust_coefficients[j];
             p.body_drag[j] = params::body_drag[j];
             p.plate.normal[j] = params::plate::normal[j];
+            p.plate.chord_direction[j] = params::plate::chord_direction[j];
             p.plate.centroid[j] = params::plate::centroid[j];
             for(int k = 0; k < 3; k++) p.J[j][k] = params::J[j][k];
         }
@@ -178,6 +183,7 @@ namespace whoop::runtime{
             }
         }
         p.rotor_torque_constant = params::rotor_torque_constant;
+        p.rotor_radius = params::plate::rotor_radius;
         p.rotor_time_constant_rising = params::rotor_time_constant_rising;
         p.rotor_time_constant_falling = params::rotor_time_constant_falling;
         p.randomization_plate = params::randomization::plate;
@@ -203,9 +209,17 @@ namespace whoop::runtime{
     // the checks of generate_params.py, so that a file refused at build time is refused here too
     inline void validate(const WhoopParams& p){
         const auto& n = p.plate.normal;
+        const auto& e1 = p.plate.chord_direction;
         check(std::fabs(std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) - 1) <= 1e-9, "plate normal is not a unit vector");
-        check(std::fabs(n[0]) <= 1e-9, "the plate must contain the body x axis (normal with zero x component)");
-        check(p.plate.downwash_factor == 0, "downwash_factor != 0 is not implemented (docs/plate_model.md: k_w = 0 for now)");
+        check(std::fabs(std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) - 1) <= 1e-9, "plate chord_direction is not a unit vector");
+        check(std::fabs(n[0] * e1[0] + n[1] * e1[1] + n[2] * e1[2]) <= 1e-9, "plate chord_direction must lie in the plate (perpendicular to the normal)");
+        check(p.plate.downwash_factor >= 0, "downwash_factor must be >= 0");
+        if(p.plate.downwash_factor > 0){
+            check(p.rotor_radius > 0, "downwash_factor > 0 needs whoop.rotor_radius");
+            double rotor_z = p.rotor_positions[0][2];
+            for(int i = 1; i < 4; i++) rotor_z = std::min(rotor_z, p.rotor_positions[i][2]);
+            check(p.plate.centroid[2] < rotor_z, "downwash_factor > 0 needs the plate centroid below the rotor discs");
+        }
         for(double d: p.body_drag) check(d >= 0, "body_drag must be non-negative");
         check(p.randomization_plate >= 0 && p.randomization_plate < 1, "randomization.plate must be in [0, 1)");
         check(p.randomization_body_drag >= 0 && p.randomization_body_drag < 1, "randomization.body_drag must be in [0, 1)");
@@ -236,6 +250,7 @@ namespace whoop::runtime{
         check(w["J"].size() == 3, "J must be 3 x 3");
         for(int j = 0; j < 3; j++) vec3(w["J"][j], p.J[j]);
         vec3(w["body_drag"], p.body_drag);
+        p.rotor_radius = w.has("rotor_radius") ? w["rotor_radius"].num() : 0;
         p.randomization_plate = r["plate"].num();
         p.randomization_body_drag = r["body_drag"].num();
         p.plate.added_mass = pl["added_mass"].num();
@@ -243,6 +258,8 @@ namespace whoop::runtime{
         p.plate.height_z = pl["height_z"].num();
         p.plate.area = pl["area"].num();
         vec3(pl["normal"], p.plate.normal);
+        if(pl.has("chord_direction")) vec3(pl["chord_direction"], p.plate.chord_direction);
+        else{ p.plate.chord_direction[0] = 1; p.plate.chord_direction[1] = 0; p.plate.chord_direction[2] = 0; }
         vec3(pl["centroid"], p.plate.centroid);
         p.plate.CN90 = pl["CN90"].num();
         p.plate.Kp_x = pl["Kp_x"].num();
@@ -256,6 +273,22 @@ namespace whoop::runtime{
     }
 
     inline WhoopParams params_from_json_file(const std::string& path){ return params_from_json(read_json_file(path)); }
+
+    // train.cpp --plate-tilt: the plate tilted by theta about body x, normal (0, cos theta, sin theta) and chord along
+    // body x (theta = 0: the vertical plate, n = y; 90 deg: horizontal, n = z). The edges keep their lengths: chord_x
+    // along x, height_z along e_1 x n = (0, -sin theta, cos theta). Components below 1e-12 are set to 0 (cos 90 deg)
+    inline void tilt_plate(WhoopParams& p, double theta_deg){
+        double theta = theta_deg * 3.141592653589793 / 180;
+        double c = std::cos(theta), s = std::sin(theta);
+        if(std::fabs(c) < 1e-12) c = 0;
+        if(std::fabs(s) < 1e-12) s = 0;
+        p.plate.normal[0] = 0;
+        p.plate.normal[1] = c;
+        p.plate.normal[2] = s;
+        p.plate.chord_direction[0] = 1;
+        p.plate.chord_direction[1] = 0;
+        p.plate.chord_direction[2] = 0;
+    }
 
     // ----- derived values, transcribed from generate_params.py in the same order of operations ------------------------
     struct Mat3{ double m[3][3]; };
@@ -295,15 +328,33 @@ namespace whoop::runtime{
         return out;
     }
 
+    inline Mat3 sheet_inertia(double mass, double c1, double c2, const double e1[3], const double e2[3]){
+        // thin rectangle about its own centroid: m / 12 (c_1^2 (I - e_1 e_1^T) + c_2^2 (I - e_2 e_2^T)), as
+        // generate_params.py (for e_1 = x, e_2 = z: m / 12 diag(c_2^2, c_1^2 + c_2^2, c_1^2))
+        Mat3 out;
+        for(int i = 0; i < 3; i++) for(int j = 0; j < 3; j++){
+            double d = i == j ? 1 : 0;
+            out.m[i][j] = mass * ((c1 * c1) * (d - e1[i] * e1[j]) + (c2 * c2) * (d - e2[i] * e2[j])) / 12;
+        }
+        return out;
+    }
+
+    inline void cross3(const double a[3], const double b[3], double out[3]){
+        out[0] = a[1] * b[2] - a[2] * b[1];
+        out[1] = a[2] * b[0] - a[0] * b[2];
+        out[2] = a[0] * b[1] - a[1] * b[0];
+    }
+
     struct Derived{
         Mat3 J_inv, J_total, J_total_inv;
-        double hovering_throttle, mass_total, hovering_throttle_total;
+        double hovering_throttle, mass_total, hovering_throttle_total, rotor_disc_area;
     };
 
     inline Derived derive(const WhoopParams& p){
-        // as generate_params.py: the sheet is a thin c_x x c_z rectangle in the body x-z plane with its centroid at
-        // plate.centroid relative to the vehicle's centre of mass; the whoop's own J is about its own centre of mass,
-        // which sits at -m_plate / m_whoop r_c [assumption, see generate_params.py]
+        // as generate_params.py: the sheet is a thin rectangle, edge c_1 (chord_x) along e_1 = chord_direction and
+        // edge c_2 (height_z) along e_2 = e_1 x n, with its centroid at plate.centroid relative to the vehicle's
+        // centre of mass; the whoop's own J is about its own centre of mass, which sits at -m_plate / m_whoop r_c
+        // [assumption, see generate_params.py]
         Derived d;
         Mat3 J;
         for(int i = 0; i < 3; i++) for(int j = 0; j < 3; j++) J.m[i][j] = p.J[i][j];
@@ -311,7 +362,9 @@ namespace whoop::runtime{
         d.mass_total = m_whoop + m_plate;
         double c_x = p.plate.chord_x, c_z = p.plate.height_z;
         const double* r_c = p.plate.centroid;
-        Mat3 J_sheet{{{m_plate * (c_z * c_z) / 12, 0, 0}, {0, m_plate * (c_x * c_x + c_z * c_z) / 12, 0}, {0, 0, m_plate * (c_x * c_x) / 12}}};
+        double e2[3];
+        cross3(p.plate.chord_direction, p.plate.normal, e2);
+        Mat3 J_sheet = sheet_inertia(m_plate, c_x, c_z, p.plate.chord_direction, e2);
         double r_whoop[3];
         for(int j = 0; j < 3; j++) r_whoop[j] = -m_plate / m_whoop * r_c[j];
         d.J_total = add3(add3(J, parallel_axis(m_whoop, r_whoop)), add3(J_sheet, parallel_axis(m_plate, r_c)));
@@ -319,6 +372,7 @@ namespace whoop::runtime{
         d.J_total_inv = inverse3(d.J_total.m);
         d.hovering_throttle = hover_command(p.rotor_thrust_coefficients, m_whoop, p.gravity[2]);
         d.hovering_throttle_total = hover_command(p.rotor_thrust_coefficients, d.mass_total, p.gravity[2]);
+        d.rotor_disc_area = 4 * 3.141592653589793 * (p.rotor_radius * p.rotor_radius);  // Python: 4 * math.pi * R ** 2
         return d;
     }
 
@@ -361,8 +415,11 @@ namespace whoop::runtime{
         plate.height_z = (T)w.plate.height_z;
         for(int i = 0; i < 3; i++){
             plate.normal[i] = (T)w.plate.normal[i];
+            plate.chord_direction[i] = (T)w.plate.chord_direction[i];
             plate.centroid[i] = (T)w.plate.centroid[i];
         }
+        plate.downwash_factor = (T)w.plate.downwash_factor;
+        plate.rotor_disc_area = (T)d.rotor_disc_area;
         plate.CN90 = (T)w.plate.CN90;
         plate.Kp_x = (T)w.plate.Kp_x;
         plate.Kp_z = (T)w.plate.Kp_z;

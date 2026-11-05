@@ -170,9 +170,12 @@ namespace whoop{
         p.height_z = (T)params::plate::height_z;
         for(int i = 0; i < 3; i++){
             p.normal[i] = (T)params::plate::normal[i];
+            p.chord_direction[i] = (T)params::plate::chord_direction[i];
             p.centroid[i] = (T)params::plate::centroid[i];
             p.wind[i] = 0;
         }
+        p.downwash_factor = (T)params::plate::downwash_factor;
+        p.rotor_disc_area = (T)params::plate::rotor_disc_area;
         p.CN90 = (T)params::plate::CN90;
         p.Kp_x = (T)params::plate::Kp_x;
         p.Kp_z = (T)params::plate::Kp_z;

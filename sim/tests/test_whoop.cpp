@@ -13,6 +13,8 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <random>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 
@@ -39,9 +41,10 @@ std::string numbers(std::initializer_list<double> values){
 }
 
 // ----- an independent transcription of docs/plate_model.md (plain doubles, explicit rotation matrix) ----------------
+// for any plate frame (n, e_1); downwash: the k_w v_i added along body z (0: none)
 struct Expected{ double F[3], tau[3], r_cp[3]; };
 
-Expected expected_plate(const whoop::Plate<double>& p, const double q[4], const double v_world[3], const double omega[3]){
+Expected expected_plate(const whoop::Plate<double>& p, const double q[4], const double v_world[3], const double omega[3], double downwash = 0){
     const double w = q[0], x = q[1], y = q[2], z = q[3];
     const double R[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)},
                             {2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)},
@@ -53,13 +56,16 @@ Expected expected_plate(const whoop::Plate<double>& p, const double q[4], const 
     v[0] += omega[1] * r[2] - omega[2] * r[1];
     v[1] += omega[2] * r[0] - omega[0] * r[2];
     v[2] += omega[0] * r[1] - omega[1] * r[0];
+    v[2] += downwash;
     const double eps = 1e-6;
     double vn = p.normal[0] * v[0] + p.normal[1] * v[1] + p.normal[2] * v[2];
     double vt[3] = {v[0] - vn * p.normal[0], v[1] - vn * p.normal[1], v[2] - vn * p.normal[2]};
     double V2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + eps;
     double Vt = std::sqrt(vt[0] * vt[0] + vt[1] * vt[1] + vt[2] * vt[2] + eps);
     double alpha = std::atan2(std::fabs(vn), Vt);
-    double c2 = vt[0] * vt[0] / (Vt * Vt);
+    const double* e1 = p.chord_direction;
+    double vt1 = vt[0] * e1[0] + vt[1] * e1[1] + vt[2] * e1[2];
+    double c2 = vt1 * vt1 / (Vt * Vt);
     double Kp = p.Kp_x * c2 + p.Kp_z * (1 - c2);
     double CN = p.CN90 * std::tanh(Kp * alpha / p.CN90);
     double sgn = vn > 0 ? 1 : (vn < 0 ? -1 : 0);
@@ -677,6 +683,231 @@ void test_plate_lift_metric(DEVICE& device){
           "; banked 20 deg: lift " + numbers({banked.plate_lift_to_weight, lift_expected}) + ", rotor thrust at hover " + numbers({level.rotor_thrust_to_weight}));
 }
 
+// ----- the general plate frame: tilted and horizontal plates, their inertia, the downwash term ---------------------
+namespace previous{
+    // plate_aerodynamics as it was before the plate frame was generalised (normal n, chord along body x, c^2 from
+    // v_t,x), verbatim: the vertical plate must give the same bits with the general code
+    template <typename DEVICE, typename T>
+    void plate_aerodynamics(DEVICE& device, const whoop::Plate<T>& plate, const T orientation[4], const T linear_velocity_world[3], const T angular_velocity_body[3], whoop::PlateAerodynamics<T>& out){
+        namespace math = rl_tools::math;
+        namespace vo = rl_tools::utils::vector_operations;
+        const auto& m = device.math;
+        constexpr T eps = whoop::PLATE_EPSILON<T>;
+        T q_conjugate[4] = {orientation[0], -orientation[1], -orientation[2], -orientation[3]};
+        T relative_world[3];
+        for(TI i = 0; i < 3; i++){
+            relative_world[i] = linear_velocity_world[i] - plate.wind[i];
+        }
+        T v[3];
+        rl_tools::rl::environments::l2f::rotate_vector_by_quaternion<DEVICE, T>(q_conjugate, relative_world, v);
+        vo::cross_product_accumulate<DEVICE, T>(angular_velocity_body, plate.centroid, v);
+        T v_n = whoop::plate_dot<T>(plate.normal, v);
+        T v_t[3];
+        for(TI i = 0; i < 3; i++){
+            v_t[i] = v[i] - v_n * plate.normal[i];
+        }
+        T V2 = whoop::plate_dot<T>(v, v) + eps;
+        T V = math::sqrt(m, V2);
+        T V_t = math::sqrt(m, whoop::plate_dot<T>(v_t, v_t) + eps);
+        T alpha = math::atan2(m, math::abs(m, v_n), V_t);
+        T c2 = v_t[0] * v_t[0] / (V_t * V_t);
+        T K_p = plate.Kp_x * c2 + plate.Kp_z * (1 - c2);
+        T C_N = plate.CN90 * math::tanh(m, K_p * alpha / plate.CN90);
+        T q_S = (T)0.5 * plate.air_density * plate.area;
+        T sign_v_n = (v_n > 0) ? (T)1 : ((v_n < 0) ? (T)-1 : (T)0);
+        for(TI i = 0; i < 3; i++){
+            out.force[i] = -q_S * C_N * V2 * sign_v_n * plate.normal[i] - q_S * plate.CT * V * v_t[i];
+        }
+        T chord = plate.chord_x * c2 + plate.height_z * (1 - c2);
+        T shift = plate.e0 * math::cos(m, alpha) * chord / V_t;
+        for(TI i = 0; i < 3; i++){
+            out.center_of_pressure[i] = plate.centroid[i] + shift * v_t[i];
+        }
+        vo::cross_product<DEVICE, T>(out.center_of_pressure, out.force, out.torque);
+        out.alpha = alpha;
+        out.airspeed = V;
+    }
+}
+
+template <typename T>
+void test_vertical_plate_unchanged(DEVICE& device, const std::string& name){
+    // random states, winds and (randomized) coefficients: the general code and the previous one, bit for bit
+    using FACTORY = whoop::EnvironmentFactory<T, TI, true, whoop::Task::VELOCITY>;
+    whoop::Plate<T> plate = FACTORY::nominal_parameters.plate;
+    std::mt19937 gen(7);
+    std::uniform_real_distribution<double> u(-1, 1);
+    int n = 100000, different = 0;
+    for(int k = 0; k < n; k++){
+        T q[4], v[3], w[3];
+        double norm = 0;
+        for(int i = 0; i < 4; i++){ q[i] = (T)u(gen); norm += (double)q[i] * q[i]; }
+        for(int i = 0; i < 4; i++) q[i] = (T)(q[i] / std::sqrt(norm));
+        for(int i = 0; i < 3; i++){ v[i] = (T)(6 * u(gen)); w[i] = (T)(10 * u(gen)); plate.wind[i] = (T)(k % 2 ? 3 * u(gen) : 0); }
+        if(k % 7 == 0){ v[0] = 0; v[1] = 0; v[2] = 0; for(int i = 0; i < 3; i++) w[i] = 0; }  // zero airspeed (eps)
+        plate.CN90 = FACTORY::nominal_parameters.plate.CN90 * (T)(1 + 0.4 * u(gen));
+        plate.Kp_x = FACTORY::nominal_parameters.plate.Kp_x * (T)(1 + 0.4 * u(gen));
+        whoop::PlateAerodynamics<T> a{}, b{};
+        whoop::plate_aerodynamics(device, plate, q, v, w, a);
+        previous::plate_aerodynamics(device, plate, q, v, w, b);
+        different += std::memcmp(a.force, b.force, sizeof(a.force)) != 0 || std::memcmp(a.torque, b.torque, sizeof(a.torque)) != 0 ||
+                     std::memcmp(a.center_of_pressure, b.center_of_pressure, sizeof(a.center_of_pressure)) != 0 ||
+                     std::memcmp(&a.alpha, &b.alpha, sizeof(T)) != 0 || std::memcmp(&a.airspeed, &b.airspeed, sizeof(T)) != 0;
+    }
+    check(different == 0, "vertical plate: the general plate frame gives the previous code bit for bit, " + name,
+          numbers({double(n)}) + " random states, " + numbers({double(different)}) + " different");
+}
+
+template <typename T>
+typename whoop::EnvironmentFactory<T, TI, true, whoop::Task::VELOCITY>::ENVIRONMENT::Parameters tilted_parameters(double theta_deg, double downwash = 0){
+    // the nominal parameters with the plate tilted by theta about body x (train.cpp --plate-tilt, --downwash)
+    namespace rt = whoop::runtime;
+    using FACTORY = whoop::EnvironmentFactory<T, TI, true, whoop::Task::VELOCITY>;
+    typename FACTORY::ENVIRONMENT::Parameters p = FACTORY::nominal_parameters;
+    rt::WhoopParams w = rt::compiled_params();
+    rt::tilt_plate(w, theta_deg);
+    w.plate.downwash_factor = downwash;
+    rt::apply<T, TI, true>(w, p);
+    return p;
+}
+
+void test_horizontal_plate_lift(DEVICE& device){
+    // horizontal plate (n = z), whoop level, flying forward at V = 4 m/s and descending at the angle alpha = 10 deg: the
+    // air comes from the front and below, the normal force pushes up, C_N with the slope K_px (in-plane wind along x)
+    auto p = tilted_parameters<double>(90);
+    const auto& pl = p.plate;
+    double V = 4, a0 = 10 * PI / 180, eps = 1e-6;
+    const double identity[4] = {1, 0, 0, 0}, zero[3] = {0, 0, 0};
+    double v_world[3] = {V * std::cos(a0), 0, -V * std::sin(a0)};
+    whoop::PlateAerodynamics<double> a;
+    whoop::plate_aerodynamics(device, pl, identity, v_world, zero, a);
+    double V2 = V * V + eps, Vt = std::sqrt(v_world[0] * v_world[0] + eps);
+    double alpha = std::atan2(V * std::sin(a0), Vt), c2 = v_world[0] * v_world[0] / (Vt * Vt);
+    double CN = pl.CN90 * std::tanh((pl.Kp_x * c2 + pl.Kp_z * (1 - c2)) * alpha / pl.CN90);
+    double qS = 0.5 * pl.air_density * pl.area;
+    double Fz = qS * CN * V2, Fx = -qS * pl.CT * std::sqrt(V2) * v_world[0];
+    // lift: perpendicular to the relative wind, in the x-z plane, upward
+    double lift = a.force[0] * std::sin(a0) + a.force[2] * std::cos(a0);
+    double weight = p.dynamics.mass * 9.81;
+    check(pl.normal[2] == 1 && pl.normal[1] == 0 && std::fabs(a.force[2] - Fz) < 1e-12 && std::fabs(a.force[0] - Fx) < 1e-12 && a.force[1] == 0 &&
+          std::fabs(a.alpha - a0) < 1e-6 && Fz > 0,
+          "horizontal plate, forward wind at alpha = 10 deg: F_z = 1/2 rho S C_N(alpha) V^2 up, friction along -x",
+          "F " + numbers({a.force[0], a.force[1], a.force[2]}) + " N, expected F_x " + numbers({Fx}) + " F_z " + numbers({Fz}) +
+          "; lift " + numbers({lift / weight}) + " of the weight, C_N " + numbers({CN}));
+}
+
+void test_tilted_plate(DEVICE& device){
+    // 1. plate tilted by theta about x, the whoop level and flying toward body -y at 4 m/s: the air meets the plate at
+    //    90 deg - theta, entirely along e_2 (c^2 = 0, slope K_pz); the normal force (0, cos, sin) has an upward part
+    double worst = 0;
+    std::string detail;
+    for(double theta: {30.0, 45.0, 60.0}){
+        auto p = tilted_parameters<double>(theta);
+        const auto& pl = p.plate;
+        double th = theta * PI / 180, V = 4, eps = 1e-6;
+        const double identity[4] = {1, 0, 0, 0}, zero[3] = {0, 0, 0};
+        double v_world[3] = {0, -V, 0};
+        whoop::PlateAerodynamics<double> a;
+        whoop::plate_aerodynamics(device, pl, identity, v_world, zero, a);
+        double c = pl.normal[1], s = pl.normal[2];
+        double vt[3] = {0, -V + V * c * c, V * c * s};  // v - v_n n with v_n = -V cos theta
+        double Vt = std::sqrt(vt[1] * vt[1] + vt[2] * vt[2] + eps), V2 = V * V + eps;
+        double alpha = std::atan2(V * c, Vt);
+        double CN = pl.CN90 * std::tanh(pl.Kp_z * alpha / pl.CN90);
+        double qS = 0.5 * pl.air_density * pl.area;
+        double F[3];
+        for(int i = 0; i < 3; i++) F[i] = qS * CN * V2 * pl.normal[i] - qS * pl.CT * std::sqrt(V2) * vt[i];
+        worst = std::max(worst, max_abs_diff(a.force, F, 3) / norm3(F));
+        worst = std::max(worst, std::fabs(a.alpha - (PI / 2 - th)) > 1e-6 ? 1.0 : 0.0);
+        detail += "theta " + numbers({theta}) + ": F_z " + numbers({a.force[2] / (p.dynamics.mass * 9.81)}) + " of the weight, alpha " + numbers({a.alpha * 180 / PI}) + " deg; ";
+    }
+    check(worst < 1e-14, "tilted plate, flying toward body -y: F = 1/2 rho S C_N(90 deg - theta) V^2 n - friction", detail + "max rel diff " + numbers({worst}));
+
+    // 2. the same plates in an oblique wind, the whoop moving, rotated and rolling: the independent transcription
+    double dmax = 0;
+    for(double theta: {30.0, 45.0, 90.0}){
+        auto p = tilted_parameters<double>(theta);
+        whoop::Plate<double> pl = p.plate;
+        pl.wind[0] = -2.0; pl.wind[1] = 1.5; pl.wind[2] = 0.7;
+        double angle = 0.7, axis[3] = {0.3, -0.5, 0.81}, axis_norm = norm3(axis);
+        double q[4] = {std::cos(angle / 2), 0, 0, 0};
+        for(int i = 0; i < 3; i++) q[i + 1] = std::sin(angle / 2) * axis[i] / axis_norm;
+        double v_world[3] = {1.2, -0.4, 0.3}, omega[3] = {0.8, -1.1, 0.5};
+        whoop::PlateAerodynamics<double> a;
+        whoop::plate_aerodynamics(device, pl, q, v_world, omega, a);
+        Expected e = expected_plate(pl, q, v_world, omega);
+        dmax = std::max({dmax, max_abs_diff(a.force, e.F, 3), max_abs_diff(a.torque, e.tau, 3)});
+    }
+    check(dmax < 1e-12, "tilted plates (30, 45, 90 deg), oblique wind, moving and rolling: F and tau as docs/plate_model.md", "max diff " + numbers({dmax}));
+}
+
+void test_rotated_plate_inertia(DEVICE&){
+    // the sheet's inertia turns with the plate: J_total(theta) - J_total(0) = R_x J_sheet R_x^T - J_sheet (the centroid,
+    // hence the parallel-axis terms, does not move), with J_sheet = m / 12 diag(c_z^2, c_x^2 + c_z^2, c_x^2)
+    auto p0 = tilted_parameters<double>(0);
+    using FACTORY = whoop::EnvironmentFactory<double, TI, true, whoop::Task::VELOCITY>;
+    bool vertical_same = std::memcmp(p0.dynamics.J, FACTORY::nominal_parameters.dynamics.J, sizeof(p0.dynamics.J)) == 0;
+    double worst = 0;
+    std::string detail;
+    for(double theta: {45.0, 90.0}){
+        auto p = tilted_parameters<double>(theta);
+        double c_x = p.plate.chord_x, c_z = p.plate.height_z, m_p = whoop::params::plate::added_mass;
+        double S[3] = {m_p * c_z * c_z / 12, m_p * (c_x * c_x + c_z * c_z) / 12, m_p * c_x * c_x / 12};
+        double th = theta * PI / 180, R[3][3] = {{1, 0, 0}, {0, std::cos(th), -std::sin(th)}, {0, std::sin(th), std::cos(th)}};
+        for(int i = 0; i < 3; i++) for(int j = 0; j < 3; j++){
+            double rotated = 0;
+            for(int k = 0; k < 3; k++) rotated += R[i][k] * S[k] * R[j][k];
+            double expected = rotated - (i == j ? S[i] : 0);
+            double got = p.dynamics.J[i][j] - p0.dynamics.J[i][j];
+            worst = std::max(worst, std::fabs(got - expected) / S[1]);
+        }
+        detail += "theta " + numbers({theta}) + ": J_yy " + numbers({p.dynamics.J[1][1]}) + ", J_zz " + numbers({p.dynamics.J[2][2]}) + ", J_yz " + numbers({p.dynamics.J[1][2]}) + "; ";
+    }
+    check(vertical_same && worst < 1e-12, "rotated plate: J_sheet turns with the plate (45 and 90 deg)", detail + "vertical = compiled J: " +
+          std::string(vertical_same ? "yes" : "NO") + ", max rel diff " + numbers({worst}));
+}
+
+void test_downwash(DEVICE& device){
+    // 1. induced velocity: v_h = sqrt(T / (2 rho A)) at V_par = 0, and v_i^2 (v_i^2 + V_par^2) = v_h^4 at 4 m/s
+    auto p = tilted_parameters<double>(90, 1.0);
+    const auto& pl = p.plate;
+    double weight = p.dynamics.mass * 9.81, A = pl.rotor_disc_area;
+    double vh = std::sqrt(weight / (2 * pl.air_density * A));
+    double vi0 = whoop::rotor_induced_velocity(device, weight, pl.air_density, A, 0.0);
+    double vi4 = whoop::rotor_induced_velocity(device, weight, pl.air_density, A, 16.0);
+    bool momentum = std::fabs(vi0 - vh) < 1e-12 && std::fabs(vi4 * vi4 * (vi4 * vi4 + 16) - vh * vh * vh * vh) < 1e-9 &&
+                    std::fabs(A - 4 * PI * 0.02 * 0.02) < 1e-15 && whoop::rotor_induced_velocity(device, 0.0, pl.air_density, A, 0.0) == 0;
+    // 2. horizontal plate under hovering rotors, at rest, k_w = 1: the wake hits it face-on and pushes it down
+    const double identity[4] = {1, 0, 0, 0}, zero[3] = {0, 0, 0};
+    whoop::PlateAerodynamics<double> a;
+    whoop::plate_aerodynamics(device, pl, identity, zero, zero, weight, a);
+    Expected e = expected_plate(pl, identity, zero, zero, vh);
+    // 3. in the dynamics, the thrust comes from the rotor states: hover command, k_w = 1 against k_w = 0
+    using STATE_BASE = rlt::rl::environments::l2f::StateBase<rlt::rl::environments::l2f::StateSpecification<double, TI>>;
+    auto p_off = tilted_parameters<double>(90, 0.0);
+    STATE_BASE s{}, d_on{}, d_off{};
+    s.orientation[0] = 1;
+    double u = p.dynamics.hovering_throttle_relative, rpm[4] = {u, u, u, u};
+    whoop::multirotor_dynamics(device, p, s, rpm, d_on);
+    whoop::multirotor_dynamics(device, p_off, s, rpm, d_off);
+    whoop::PlateAerodynamics<double> a_off;
+    whoop::plate_aerodynamics(device, p_off.plate, identity, zero, zero, a_off);
+    double dvz = d_on.linear_velocity[2] - d_off.linear_velocity[2], dvz_expected = (a.force[2] - a_off.force[2]) / p.dynamics.mass;
+    // 4. refused above the rotor discs
+    bool refused = false;
+    try{
+        whoop::runtime::WhoopParams w = whoop::runtime::compiled_params();
+        w.plate.downwash_factor = 1;
+        w.plate.centroid[2] = 0.04;
+        whoop::runtime::validate(w);
+    }
+    catch(const std::runtime_error&){ refused = true; }
+    check(momentum && max_abs_diff(a.force, e.F, 3) < 1e-12 && a.force[2] < 0 && std::fabs(a.downwash - vh) < 1e-12 &&
+          std::fabs(dvz - dvz_expected) < 1e-12 && refused,
+          "downwash k_w = 1: momentum-theory v_i, the hover wake pushes a horizontal plate down, thrust from the rotor states",
+          "v_h " + numbers({vh}) + " m/s, v_i at 4 m/s " + numbers({vi4}) + "; F_z at hover " + numbers({a.force[2] / weight}) + " of the weight; dv_z/dt change " +
+          numbers({dvz, dvz_expected}) + "; plate above the discs refused: " + (refused ? "yes" : "NO"));
+}
+
 int main(){
     DEVICE device;
     rlt::init(device);
@@ -700,6 +931,12 @@ int main(){
     test_runtime_params(device);
     test_power_cost(device);
     test_plate_lift_metric(device);
+    test_vertical_plate_unchanged<double>(device, "double");
+    test_vertical_plate_unchanged<float>(device, "float");
+    test_horizontal_plate_lift(device);
+    test_tilted_plate(device);
+    test_rotated_plate_inertia(device);
+    test_downwash(device);
     std::cout << (failures == 0 ? "all checks passed" : std::to_string(failures) + " check(s) failed") << std::endl;
     return failures == 0 ? 0 : 1;
 }

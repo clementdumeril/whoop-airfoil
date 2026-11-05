@@ -35,7 +35,8 @@ namespace whoop{
         }
         m.rotor_thrust_to_weight = thrust / weight;
         if(p.plate.area > 0){
-            plate_aerodynamics(device, p.plate, s.orientation, s.linear_velocity, s.angular_velocity, m.aero);
+            // the thrust is also what the downwash term needs (k_w > 0): all four rotors point along body z
+            plate_aerodynamics(device, p.plate, s.orientation, s.linear_velocity, s.angular_velocity, thrust, m.aero);
             T f_world[3];
             rl_tools::rl::environments::l2f::rotate_vector_by_quaternion<DEVICE, T>(s.orientation, m.aero.force, f_world);
             m.plate_lift_to_weight = f_world[2] / weight;

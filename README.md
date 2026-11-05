@@ -11,12 +11,14 @@ Fly in Seconds" (RA-L 2024) and run the policy on board in Betaflight.
 ## Status
 
 - [x] Simulator: the L2F multirotor environment of RLtools with the whoop, its body drag and the plate force and
-  torque, unit tests (35/35), hover and velocity tasks, training with SAC and the L2F update intervals
+  torque, unit tests (43/43), hover and velocity tasks, training with SAC and the L2F update intervals
   ([`docs/sim.md`](docs/sim.md))
 - [x] Randomization of the plate coefficients and the body drag in training; optional motor cuts in training and a
   motor-cut scenario
 - [x] Parameters read at run time (`--params`, `--plate-z`), an optional rotor power cost (`--thrust-cost`), a speed
   sweep that measures rotor thrust and plate lift
+- [x] Plates of any orientation (`--plate-tilt`, normal and chord direction in the JSON) and a crude propeller-downwash
+  term on the plate (`--downwash`), off by default
 - [x] Identification tested on synthetic flights, with and without the plate ([`sysid/README.md`](sysid/README.md)),
   and the whole chain sim-to-sim: fly a "true" drone, identify it, train on the result, fly on the truth
 - [ ] 10-seed trainings on Savio (`sim/slurm/`)
@@ -61,6 +63,19 @@ trained plate policy (2–4 m/s, 1M steps) reaches that bound in its best headin
 thrust at 4 m/s with the plate lifting 10.2 %; over all 8 headings 96.1 % (289 mN against 296 mN for the whoop without
 the plate). A rotor power cost in the reward did not increase the saving. Figure
 [`sim/figures/plate_lift_vs_speed.png`](sim/figures/plate_lift_vs_speed.png), numbers in [`docs/sim.md`](docs/sim.md).
+
+Tilted and horizontal plates (same plate, tilted by θ about body x, 4 cm under the centre of mass;
+[`docs/sim.md`](docs/sim.md), figure [`sim/figures/plate_tilt_trim.png`](sim/figures/plate_tilt_trim.png)). Without
+propeller downwash in the model, a plate tilted 30–60° carries weight at first order: at best 81.9 % of the weight in
+rotor thrust at 4 m/s with the plate lifting 19.7 % (θ = 45°), 89.5 % at 3 m/s, flying sideways toward the plate's
+lower face. The 45° policy (1M steps, one seed) reaches that bound in the headings where that face meets the air
+(82.5 %, 19.6 % lift at 4 m/s), but it keeps its yaw near world x, so in the opposite headings the plate pushes down
+(113–116 %) and the mean over 8 headings is 100.6 %. A horizontal plate cannot lift in steady level flight (its normal
+force is along the thrust and the thrust axis leans into the path): 102–105 %. These numbers neglect the rotors' wake,
+which hits a tilted or horizontal plate under the props; a crude downwash term (the whole plate in the momentum-theory
+induced velocity) turns the 45° saving into a 9 % loss at 4 m/s and costs the horizontal plate 60 % of the weight. The
+real effect is between and was not measured. In the motor-cut scenario the horizontal plate is the only plate that comes
+back from a 0.3 s cut (5 of 5, losing 0.6–1.2 m); at 0.4 s it flips like the others.
 
 On synthetic flights of 2 min, the identification recovers the thrust curve, motor time constants, roll and pitch
 inertia, torque constant and the plate's normal-force coefficients within about 1–2.5 % of the truth; the plate's

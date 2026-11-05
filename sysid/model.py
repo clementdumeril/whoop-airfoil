@@ -36,16 +36,33 @@ TRUE_BODY_DRAG = np.array([0.008, 0.008, 0.004])
 # ----------------------------------------------------------------------------------------------------
 # Parameters
 # ----------------------------------------------------------------------------------------------------
-def plate_inertia(m_p, cx, cz, rc):
-    """Inertia of a thin rectangular plate in the body x-z plane about the CoM (parallel-axis theorem).
+def plate_inertia(m_p, cx, cz, rc, e1=None, n=None):
+    """Inertia of a thin rectangular plate about the CoM (parallel-axis theorem).
 
-    The plate centroid rc only has a z component in the nominal file, so the products of inertia vanish;
-    we keep only the diagonal to stay consistent with the diagonal J of the whoop.
+    Without e1 and n the plate is the nominal vertical one, in the body x-z plane (cx along x, cz along z); the plate
+    centroid rc only has a z component in the nominal file, so the products of inertia vanish and only the diagonal is
+    kept, consistent with the diagonal J of the whoop. With e1 (chord direction, edge cx) and n (normal), the edge cz is
+    along e2 = e1 x n and the full matrix is returned (a tilted plate has products of inertia).
     """
     x, y, z = rc
-    return m_p * np.diag([cz**2 / 12 + y**2 + z**2,
-                          (cx**2 + cz**2) / 12 + x**2 + z**2,
-                          cx**2 / 12 + x**2 + y**2])
+    if e1 is None or n is None:
+        return m_p * np.diag([cz**2 / 12 + y**2 + z**2,
+                              (cx**2 + cz**2) / 12 + x**2 + z**2,
+                              cx**2 / 12 + x**2 + y**2])
+    e1, n, rc = np.asarray(e1, float), np.asarray(n, float), np.asarray(rc, float)
+    e2 = np.cross(e1, n)
+    I3 = np.eye(3)
+    sheet = (cx**2 * (I3 - np.outer(e1, e1)) + cz**2 * (I3 - np.outer(e2, e2))) / 12
+    return m_p * (sheet + (rc @ rc) * I3 - np.outer(rc, rc))
+
+
+def induced_velocity(thrust, rho, disc_area, v_par2):
+    """Rotor induced velocity, momentum theory with Glauert's forward-flight correction and no axial flow:
+    v_h^2 = T / (2 rho A), v_i^2 (v_i^2 + V_par^2) = v_h^4 (the same expression as sim/include/whoop/plate.h)."""
+    thrust = np.maximum(np.asarray(thrust, float), 0.0)
+    vh2 = thrust / (2 * rho * disc_area) if disc_area > 0 else np.zeros_like(thrust)
+    vi2 = 2 * vh2 * vh2 / np.maximum(v_par2 + np.sqrt(v_par2 * v_par2 + 4 * vh2 * vh2), 1e-300)
+    return np.sqrt(vi2)
 
 
 def load_params(path=DEFAULT_PARAMS, plate=False, body_drag=TRUE_BODY_DRAG):
@@ -76,12 +93,16 @@ def load_params(path=DEFAULT_PARAMS, plate=False, body_drag=TRUE_BODY_DRAG):
         pl = {
             "S": float(p["area"]), "cx": float(p["chord_x"]), "cz": float(p["height_z"]),
             "n": np.array(p["normal"], float), "rc": np.array(p["centroid"], float),
+            # in-plane unit vector along the edge cx (docs/plate_model.md); body x for the nominal vertical plate
+            "e1": np.array(p.get("chord_direction", [1, 0, 0]), float),
+            # crude downwash term: k_w times the rotors' induced velocity along body z, disc area A = 4 pi R^2
+            "kw": float(p["downwash_factor"]), "A": 4 * np.pi * float(w.get("rotor_radius", 0.0)) ** 2,
             "CN90": float(p["CN90"]), "Kpx": float(p["Kp_x"]), "Kpz": float(p["Kp_z"]),
             "CT": float(p["CT"]), "e0": float(p["e0"]), "rho": float(p["air_density"]),
             "mass": float(p["added_mass"]),
         }
-        # The downwash term k_w v_i z needs the induced velocity; it is 0 in the file, so it is not implemented.
-        assert float(p["downwash_factor"]) == 0.0, "downwash term not implemented"
+        if pl["kw"] > 0:
+            assert pl["A"] > 0 and pl["rc"][2] < np.min(P["rotor_pos"][:, 2]), "downwash needs rotor_radius and the plate below the rotors"
         P["plate"] = pl
         P["mass"] += pl["mass"]
         P["J"] = P["J"] + plate_inertia(pl["mass"], pl["cx"], pl["cz"], pl["rc"])
@@ -206,20 +227,25 @@ def body_drag_force(P, v_body):
     return -P["body_drag"] * v_body
 
 
-def plate_wrench(pl, v_body, omega, aux=False):
+def plate_wrench(pl, v_body, omega, aux=False, thrust=0.0):
     """Plate force and torque in the body frame, exactly docs/plate_model.md.
 
     v_body: velocity of the CoM relative to the air in the body frame, (3,) or (N, 3).
     omega: body angular velocity. pl: plate dict (CN90, Kpx, Kpz, CT, e0 may be overridden).
+    thrust: total rotor thrust [N], only used by the downwash term (pl["kw"] > 0).
     """
     n, rc = pl["n"], pl["rc"]
+    e1 = pl.get("e1", np.array([1.0, 0.0, 0.0]))
     v = v_body + cross(omega, rc)                    # local velocity at the plate centroid
+    if pl.get("kw", 0.0) > 0:
+        v_par2 = v_body[..., 0] ** 2 + v_body[..., 1] ** 2
+        v = v + (pl["kw"] * induced_velocity(thrust, pl["rho"], pl["A"], v_par2))[..., None] * np.array([0.0, 0.0, 1.0])
     vn = v @ n
     vt = v - vn[..., None] * n
     V2 = np.sum(v * v, axis=-1) + EPS
     Vt = np.sqrt(np.sum(vt * vt, axis=-1) + EPS)
     alpha = np.arctan2(np.abs(vn), Vt)
-    c2 = vt[..., 0] ** 2 / Vt ** 2
+    c2 = (vt @ e1) ** 2 / Vt ** 2
     Kp = pl["Kpx"] * c2 + pl["Kpz"] * (1 - c2)
     CN = pl["CN90"] * np.tanh(Kp * alpha / pl["CN90"])
     qS = 0.5 * pl["rho"] * pl["S"]
@@ -233,12 +259,12 @@ def plate_wrench(pl, v_body, omega, aux=False):
     return F, tau
 
 
-def aero_wrench(P, v_body, omega):
-    """Body drag (acts at the CoM, no torque) plus plate."""
+def aero_wrench(P, v_body, omega, thrust=0.0):
+    """Body drag (acts at the CoM, no torque) plus plate (thrust: total rotor thrust, for the plate's downwash term)."""
     F = body_drag_force(P, v_body)
     tau = np.zeros_like(F)
     if P["plate"] is not None:
-        Fp, tp = plate_wrench(P["plate"], v_body, omega)
+        Fp, tp = plate_wrench(P["plate"], v_body, omega, thrust=thrust)
         F = F + Fp
         tau = tau + tp
     return F, tau
@@ -257,7 +283,7 @@ def derivative(P, x, u_m, wind=None):
     v_air_body = R.T @ (v if wind is None else v - wind)
     f = rotor_thrust(P, u_m)
     Fr, tr = rotor_wrench(P, f)
-    Fa, ta = aero_wrench(P, v_air_body, w)
+    Fa, ta = aero_wrench(P, v_air_body, w, thrust=Fr[2])
     F = Fr + Fa
     acc = R @ F / P["mass"] + P["g"]
     J = P["J"]

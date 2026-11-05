@@ -16,22 +16,27 @@
     "_J": "inertia [kg m^2], diagonal [assumption, scaled from the Crazyflie]",
     "J": [[1.2e-05, 0, 0], [0, 1.2e-05, 0], [0, 0, 2.2e-05]],
     "_body_drag": "linear drag of the bare whoop at the centre of mass, no torque: F = -diag(d) v_rel, v_rel the velocity relative to the air in the body frame [kg/s]; the truth of the synthetic flights in sysid/model.py (8 % of the weight at 3 m/s horizontally, less along z where the ducts are open) [assumption]",
-    "body_drag": [0.008, 0.008, 0.004]
+    "body_drag": [0.008, 0.008, 0.004],
+    "_rotor_radius": "propeller radius [m], 40 mm propellers; only used by the crude downwash term on the plate (plate.downwash_factor > 0) [assumption]",
+    "rotor_radius": 0.02
   },
   "plate": {
     "_comment": "Vertical 3 mm EPP sheet under the frame, in the body x-z plane; model of research/flat_plate_aero.md section 1.5, Model B (saturating normal force) plus in-plane friction",
+    "_geometry": "flat rectangle: unit normal n, edge chord_x along the in-plane unit vector chord_direction e_1, edge height_z along e_1 x n (docs/plate_model.md); vertical plate: n = y, e_1 = x, e_1 x n = z; Kp_x and Kp_z are the slopes for the in-plane wind along e_1 and e_1 x n",
     "_added_mass": "mass of the plate itself [kg]; with the plate the vehicle weighs mass + added_mass and the plate inertia is added to J",
     "added_mass": 0.0007,
     "chord_x": 0.12,
     "height_z": 0.065,
     "area": 0.0078,
     "normal": [0, 1, 0],
+    "chord_direction": [1, 0, 0],
     "centroid": [0, 0, -0.04],
     "CN90": 1.15,
     "Kp_x": 0.84,
     "Kp_z": 2.46,
     "CT": 0.02,
     "e0": 0.25,
+    "_downwash_factor": "k_w: k_w times the rotors' induced velocity (momentum theory) added along body z to the plate's velocity relative to the air; 0 = no downwash",
     "downwash_factor": 0.0,
     "air_density": 1.2
   },
