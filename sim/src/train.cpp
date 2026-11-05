@@ -8,12 +8,27 @@
 // SAC by default: in the Fixed-Wing project the same intervals and batch gave smooth commands with SAC and bang-bang
 // commands with TD3, the algorithm of the paper; the whoop_train_td3_* targets train with TD3 (WHOOP_TD3).
 //
+// The aerodynamics (plate coefficients and body drag) are randomized per episode unless --no-randomization; with
+// --motor-cuts P (velocity task) a fraction P of the training episodes has all motors cut for 0.2-0.5 s.
+//
 // whoop_train_<sac|td3>_<hover|velocity>_<noplate|plate> <out_dir> [seed] [steps] [--eval-interval N] [--no-curriculum]
+//                                                         [--no-randomization] [--motor-cuts P]
 //   out_dir gets config.json; progress.csv (episode length and return of the last 50k steps, every 10k steps, with the
 //   wall clock); evaluation_progress.csv (the fixed test flights every N steps, default 50000); evaluation.json and
-//   flights.csv (the final actor on the fixed test flights: 100 starts sampled once with seed 12345, the first 10
-//   written step by step); actor.h (the trained actor as C++ code, the checkpoint format of L2F); runner_checks.json
-//   (evidence from the replay buffer that the RLtools runner used the whoop initial states and references)
+//   flights.csv (the final actor on the fixed test flights: 100 starts sampled once with seed 12345, nominal
+//   aerodynamics, the first 10 written step by step); evaluation_randomized.json (the same starts with randomized
+//   aerodynamics, when training randomized them); actor.h (the trained actor as C++ code, the checkpoint format of
+//   L2F) and actor.tar (the same weights, read back by --scenario); runner_checks.json (evidence from the replay
+//   buffer that the RLtools runner used the whoop initial states, references and motor cuts)
+//
+// whoop_train_<sac|td3>_velocity_<noplate|plate> <out_dir> --scenario <actor.tar> [--scenario-seeds N] [--speed V]
+//                                                [--cut-time S] [--cut-duration S] [--duration S]
+//   no training: the motor-cut scenario with a trained actor. The whoop starts level at rest at the origin and
+//   follows the reference of the velocity task straight along world x at V m/s (default 3, 1 s ramp); at --cut-time
+//   (default 1.5 s) all motor commands are forced to 0 for --cut-duration (default 0.4 s), then the policy flies again
+//   until --duration (default 5 s, at most the 5 s episode). Nominal aerodynamics; the N seeds (default 5) change the
+//   random force and torque and the sensor noise. out_dir gets config.json, flights.csv (the format of training plus
+//   a motors_cut column) and scenario.json (altitude lost and recovery, per seed)
 #include <rl_tools/operations/cpu_mux.h>
 
 #include <whoop/operations.h>
@@ -53,6 +68,13 @@
 #include <rl_tools/nn/layers/sample_and_squash/persist_code.h>
 #include <rl_tools/nn_models/mlp/persist_code.h>
 #include <rl_tools/nn_models/sequential/persist_code.h>
+// and as a tar file of the weights (RLtools' dependency-free checkpoint backend), which the scenario mode reads back
+#include <rl_tools/persist/backends/tar/operations_cpu.h>
+#include <rl_tools/nn/layers/dense/persist.h>
+#include <rl_tools/nn/layers/sample_and_squash/persist.h>
+#include <rl_tools/nn/layers/td3_sampling/persist.h>
+#include <rl_tools/nn_models/mlp/persist.h>
+#include <rl_tools/nn_models/sequential/persist.h>
 
 #include <algorithm>
 #include <array>
@@ -166,6 +188,8 @@ using LOOP_CONFIG = rlt::rl::algorithms::sac::loop::core::Config<TYPE_POLICY, TI
 #endif
 using LOOP_STATE = LOOP_CONFIG::State<LOOP_CONFIG>;
 static_assert(LOOP_CORE_PARAMETERS::N_ENVIRONMENTS == 1, "one whoop, as L2F");
+// the actor for one observation at a time, without gradients: what is exported and what the scenario flies
+using ACTOR_FORWARD = LOOP_CONFIG::NN::ACTOR_TYPE::template CHANGE_BATCH_SIZE<TI, 1>::template CHANGE_CAPABILITY<rlt::nn::capability::Forward<true>>;
 
 template <typename BUFFER>
 TI filled(const BUFFER& rb){ return rb.full ? BUFFER::CAPACITY : rb.position; }
@@ -229,14 +253,26 @@ std::string runner_checks(const RUNNER& runner){
     // in the replay buffer must show attitudes beyond 57 deg (the RLtools sampler draws at most 1 rad), and the
     // velocity task's references speeds of 1-4 m/s (the L2F Lissajous default stays below about 1.4 m/s)
     const auto& rb = rlt::get(runner.replay_buffers, 0, 0);
-    TI n = filled(rb), starts = 0, tilted = 0;
+    TI n = filled(rb), starts = 0, tilted = 0, cut_steps = 0, cut_episodes = 0;
+    bool cut_in_episode = false;
     double max_reference_speed = 0, max_reference_vz = 0;
     const double cos_57 = std::cos(57.3 / 180 * 3.14159265358979323846);
+    // the most recent command of the action history comes first in its block at the end of the actor observation; a
+    // cut step writes exactly -1 for all four motors there, which the squashed policy and the uniform warmup never do
+    constexpr TI LAST_ACTION = ENVIRONMENT::Observation::DIM - FACTORY::ACTION_HISTORY_LENGTH * ENVIRONMENT::ACTION_DIM;
     for(TI i = 0; i < n; i++){
         bool start = i == 0 || rlt::get(rb.truncated, i - 1, 0) > T(0.5);
         if(start){
             starts++;
             tilted += rlt::get(rb.observations_privileged, i, 11) < cos_57;  // R_zz = cos(tilt)
+            cut_in_episode = false;
+        }
+        bool cut = true;
+        for(TI j = 0; j < ENVIRONMENT::ACTION_DIM; j++) cut &= rlt::get(rb.observations, i, LAST_ACTION + j) == T(-1);
+        if(cut && !start){
+            cut_steps++;
+            if(!cut_in_episode) cut_episodes++;
+            cut_in_episode = true;
         }
         if constexpr(WHOOP_TASK_VELOCITY){
             double v_ref[3];
@@ -250,6 +286,7 @@ std::string runner_checks(const RUNNER& runner){
     std::ostringstream json;
     json << "{\n  \"episode_starts\": " << starts << ",\n  \"starts_tilted_above_57_deg\": " << tilted_fraction
          << ",\n  \"max_reference_speed\": " << max_reference_speed << ",\n  \"max_reference_vertical_speed\": " << max_reference_vz
+         << ",\n  \"episodes_with_motor_cut\": " << cut_episodes << ",\n  \"motor_cut_steps\": " << cut_steps
          << ",\n  \"whoop_samplers_used\": " << (ok ? "true" : "false") << "\n}\n";
     return json.str();
 }
@@ -265,13 +302,17 @@ struct TestSet{
 
 // note: whoop::sample_initial_parameters, whoop::sample_initial_state and whoop::reward are called by name here. The
 // RLtools runner finds them by argument-dependent lookup, but a call qualified with rlt:: would bypass them
-TestSet test_set(DEVICE& device, TI seed){
-    // sampled from the training distribution with a fixed seed, so that every run is tested on the same flights
+TestSet test_set(DEVICE& device, TI seed, bool randomization){
+    // sampled from the training distribution with a fixed seed, so that every run is tested on the same flights. No
+    // motor cuts; the sampler draws random numbers for the randomization only when it is on, so the nominal test set
+    // has the same starts and references whatever the training options
     TestSet set;
     set.parameters.resize(N_TESTS);
     set.starts.resize(N_TESTS);
     ENVIRONMENT env;
     rlt::init(device, env);
+    env.parameters.randomization.enabled = randomization;
+    env.parameters.motor_cut.probability = 0;
     RNG rng;
     rlt::malloc(device, rng);
     rlt::init(device, rng, seed);
@@ -289,6 +330,50 @@ struct Summary{
 };
 
 double norm3(const T* v){ return std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]); }
+
+// a template only so that the velocity-task branch is not compiled for hover
+template <typename PARAMETERS, typename STATE>
+void desired_state(DEVICE& device, ENVIRONMENT& env, PARAMETERS& p, const STATE& state, STATE& reference, RNG& rng){
+    // L2F's reference, except after its last step: L2F's trajectory then runs backwards (its velocity changes sign).
+    // An episode ends there, so only the state after the last step sees it, but that one step adds an error of twice
+    // the speed; for the errors and the plots the reference holds the end of the line instead
+    rlt::get_desired_state(device, env, p, state, reference, rng);
+    if constexpr(WHOOP_TASK_VELOCITY){
+        using TRAJECTORY = decltype(p.trajectory);
+        if(state.trajectory_step >= TRAJECTORY::LENGTH){
+            const auto& last = p.trajectory.steps[TRAJECTORY::LENGTH - 1];
+            T ahead = (state.trajectory_step - (TRAJECTORY::LENGTH - 1)) * p.integration.dt;
+            for(TI i = 0; i < 3; i++){
+                reference.position[i] = last.position[i] + last.linear_velocity[i] * ahead;
+                reference.linear_velocity[i] = last.linear_velocity[i];
+            }
+        }
+    }
+}
+
+// flights.csv: one row per simulation step, the state after the step (the scenario adds a motors_cut column)
+const char* FLIGHTS_HEADER = "flight,t,x,y,z,vx,vy,vz,roll_deg,pitch_deg,yaw_deg,reference_x,reference_y,reference_z,reference_vx,reference_vy,reference_vz,"
+                             "command_1,command_2,command_3,command_4,rotor_1,rotor_2,rotor_3,rotor_4,plate_fx,plate_fy,plate_fz,plate_alpha_deg,airspeed,terminated";
+
+void write_flight_row(std::ostream& out, TI flight, double t, const ENVIRONMENT::State& next, const ENVIRONMENT::State& reference, const T command[4],
+                      const whoop::PlateAerodynamics<T>& aero, bool terminated){
+    // command: the motor command in [0, 1] that was applied during the step
+    const T* q = next.orientation;
+    const double deg = 180 / 3.14159265358979323846;
+    double roll = std::atan2(2 * (q[0] * q[1] + q[2] * q[3]), 1 - 2 * (q[1] * q[1] + q[2] * q[2])) * deg;
+    double pitch = std::asin(std::clamp(2 * (q[0] * q[2] - q[3] * q[1]), T(-1), T(1))) * deg;
+    double yaw = std::atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3])) * deg;
+    out << flight << "," << t;
+    for(TI i = 0; i < 3; i++) out << "," << next.position[i];
+    for(TI i = 0; i < 3; i++) out << "," << next.linear_velocity[i];
+    out << "," << roll << "," << pitch << "," << yaw;
+    for(TI i = 0; i < 3; i++) out << "," << reference.position[i];
+    for(TI i = 0; i < 3; i++) out << "," << reference.linear_velocity[i];
+    for(TI i = 0; i < 4; i++) out << "," << command[i];
+    for(TI i = 0; i < 4; i++) out << "," << next.rpm[i];
+    for(TI i = 0; i < 3; i++) out << "," << aero.force[i];
+    out << "," << aero.alpha * deg << "," << aero.airspeed << "," << terminated;
+}
 
 template <typename ACTOR>
 Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, const std::filesystem::path& flights_csv = {}){
@@ -320,8 +405,7 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
     std::ofstream flights;
     if(!flights_csv.empty()){
         flights.open(flights_csv);
-        flights << "flight,t,x,y,z,vx,vy,vz,roll_deg,pitch_deg,yaw_deg,reference_x,reference_y,reference_z,reference_vx,reference_vy,reference_vz,"
-                   "command_1,command_2,command_3,command_4,rotor_1,rotor_2,rotor_3,rotor_4,plate_fx,plate_fy,plate_fz,plate_alpha_deg,airspeed,terminated\n";
+        flights << FLIGHTS_HEADER << "\n";
     }
     for(TI step = 0; step < ENVIRONMENT::EPISODE_STEP_LIMIT; step++){
         for(TI k = 0; k < N_TESTS; k++){
@@ -337,11 +421,11 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
             auto action = rlt::view(device, actions, rlt::matrix::ViewSpec<1, ENVIRONMENT::ACTION_DIM>{}, k, 0);
             for(TI i = 0; i < 4; i++) rlt::set(action, 0, i, std::clamp(rlt::get(action, 0, i), T(-1), T(1)));
             ENVIRONMENT::State next;
-            rlt::step(device, env, p, states[k], action, next, rng);
+            whoop::step(device, env, p, states[k], action, next, rng);
             returns[k] += whoop::reward(device, env, p, states[k], action, next, rng);
             bool terminated = rlt::terminated(device, env, p, next, rng);
             ENVIRONMENT::State reference;
-            rlt::get_desired_state(device, env, p, next, reference, rng);
+            desired_state(device, env, p, next, reference, rng);
             T e_p[3], e_v[3];
             for(TI i = 0; i < 3; i++){
                 e_p[i] = next.position[i] - reference.position[i];
@@ -360,21 +444,10 @@ Summary evaluate(DEVICE& device, const ACTOR& actor, TestSet& tests, RNG& rng, c
                 plate_samples += 1;
             }
             if(k < N_RECORDED && flights.is_open()){
-                const T* q = next.orientation;
-                const double deg = 180 / 3.14159265358979323846;
-                double roll = std::atan2(2 * (q[0] * q[1] + q[2] * q[3]), 1 - 2 * (q[1] * q[1] + q[2] * q[2])) * deg;
-                double pitch = std::asin(std::clamp(2 * (q[0] * q[2] - q[3] * q[1]), T(-1), T(1))) * deg;
-                double yaw = std::atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3])) * deg;
-                flights << k << "," << (step + 1) * p.integration.dt;
-                for(TI i = 0; i < 3; i++) flights << "," << next.position[i];
-                for(TI i = 0; i < 3; i++) flights << "," << next.linear_velocity[i];
-                flights << "," << roll << "," << pitch << "," << yaw;
-                for(TI i = 0; i < 3; i++) flights << "," << reference.position[i];
-                for(TI i = 0; i < 3; i++) flights << "," << reference.linear_velocity[i];
-                for(TI i = 0; i < 4; i++) flights << "," << (rlt::get(action, 0, i) + 1) / 2;  // command in [0, 1]
-                for(TI i = 0; i < 4; i++) flights << "," << next.rpm[i];
-                for(TI i = 0; i < 3; i++) flights << "," << aero.force[i];
-                flights << "," << aero.alpha * deg << "," << aero.airspeed << "," << terminated << "\n";
+                T command[4];
+                for(TI i = 0; i < 4; i++) command[i] = (rlt::get(action, 0, i) + 1) / 2;  // command in [0, 1]
+                write_flight_row(flights, k, (step + 1) * p.integration.dt, next, reference, command, aero, terminated);
+                flights << "\n";
             }
             states[k] = next;
             if(terminated){ done[k] = true; failed[k] = true; }
@@ -472,26 +545,265 @@ void save_actor(DEVICE& device, const ACTOR& actor, TestSet& tests, const std::f
     rlt::free(device, rng);
 }
 
+// ----- the actor as a tar file (weights only), read back by the scenario mode ---------------------------------------------
+template <typename ACTOR>
+void save_actor_tar(DEVICE& device, const ACTOR& actor, const std::filesystem::path& path){
+    ACTOR_FORWARD forward;
+    rlt::malloc(device, forward);
+    rlt::copy(device, device, actor, forward);
+    rlt::persist::backends::tar::Writer writer;
+    rlt::persist::backends::tar::WriterGroup<rlt::persist::backends::tar::WriterGroupSpecification<TI, decltype(writer)>> root{"", &writer};
+    auto group = rlt::create_group(device, root, "actor");
+    rlt::save(device, forward, group);
+    rlt::persist::backends::tar::finalize(device, writer);
+    std::ofstream out(path, std::ios::binary);
+    out.write(writer.buffer.data(), writer.buffer.size());
+    rlt::free(device, forward);
+}
+
+void load_actor_tar(DEVICE& device, ACTOR_FORWARD& actor, const std::filesystem::path& path){
+    std::ifstream file(path, std::ios::binary);
+    if(!file) throw std::runtime_error("cannot read " + path.string());
+    std::vector<char> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    rlt::persist::backends::tar::ReaderGroup<rlt::persist::backends::tar::ReaderGroupSpecification<TI>> reader;
+    reader.data.data = data.data();
+    reader.data.size = data.size();
+    auto group = rlt::get_group(device, reader, "actor");
+    if(!rlt::load(device, actor, group)) throw std::runtime_error("could not load the actor from " + path.string() + " (another variant?)");
+}
+
+// the deterministic action (mean of the policy) for one observation
+struct Policy{
+    ACTOR_FORWARD::State<true> state;
+    ACTOR_FORWARD::Buffer<true> buffer;
+    rlt::Matrix<rlt::matrix::Specification<T, TI, 1, ENVIRONMENT::Observation::DIM>> observation;
+    rlt::Matrix<rlt::matrix::Specification<T, TI, 1, ENVIRONMENT::ACTION_DIM>> action;
+    Policy(DEVICE& device, ACTOR_FORWARD& actor, RNG& rng){
+        rlt::malloc(device, state);
+        rlt::malloc(device, buffer);
+        rlt::malloc(device, observation);
+        rlt::malloc(device, action);
+        rlt::reset(device, actor, state, rng);
+    }
+    void act(DEVICE& device, ACTOR_FORWARD& actor, RNG& rng){
+        auto input = rlt::to_tensor(device, observation);
+        auto output = rlt::to_tensor(device, action);
+        rlt::evaluate_step(device, actor, input, state, output, buffer, rng, rlt::Mode<rlt::mode::Evaluation<>>{});
+        for(TI i = 0; i < ENVIRONMENT::ACTION_DIM; i++) rlt::set(action, 0, i, std::clamp(rlt::get(action, 0, i), T(-1), T(1)));
+    }
+    void free(DEVICE& device){
+        rlt::free(device, state);
+        rlt::free(device, buffer);
+        rlt::free(device, observation);
+        rlt::free(device, action);
+    }
+};
+
+// ----- motor-cut scenario -----------------------------------------------------------------------------------------------
+struct ScenarioOptions{
+    TI seeds = 5;
+    T speed = 3;            // [m/s] reference along world x, reached after the 1 s ramp of the velocity task
+    T cut_time = 1.5;       // [s]
+    T cut_duration = 0.4;   // [s]
+    T duration = 5;         // [s]
+};
+
+std::string motor_cut_scenario(DEVICE& device, ACTOR_FORWARD& actor, const ScenarioOptions& o, const std::filesystem::path& flights_csv){
+    // fly the velocity-task policy forward, cut every motor for a while, then give control back and measure what is
+    // lost. There is no ground in L2F: the altitude lost is relative to the height at the cut (the reference is z = 0)
+    if constexpr(!WHOOP_TASK_VELOCITY){
+        throw std::runtime_error("the motor-cut scenario needs a velocity-task policy");
+    }
+    else{
+        const double dt = FACTORY::nominal_parameters.integration.dt;
+        const TI n_steps = (TI)std::lround(o.duration / dt);
+        if(n_steps < 1 || n_steps > ENVIRONMENT::EPISODE_STEP_LIMIT) throw std::runtime_error("--duration must be within the 5 s episode");
+        const TI cut_start = (TI)std::lround(o.cut_time / dt), cut_end = (TI)std::lround((o.cut_time + o.cut_duration) / dt);
+        if(cut_end > n_steps) throw std::runtime_error("the cut must end before --duration");
+        std::ofstream flights(flights_csv);
+        flights << FLIGHTS_HEADER << ",motors_cut\n";
+        std::ostringstream json;
+        json << std::setprecision(5) << "{\n  \"speed\": " << o.speed << ",\n  \"cut_time\": " << o.cut_time << ",\n  \"cut_duration\": " << o.cut_duration
+             << ",\n  \"duration\": " << o.duration << ",\n  \"plate_area\": " << FACTORY::nominal_parameters.plate.area << ",\n  \"flights\": [";
+        double lost_sum = 0;
+        int recovered_count = 0;
+        for(TI k = 0; k < o.seeds; k++){
+            RNG rng;
+            rlt::malloc(device, rng);
+            rlt::init(device, rng, k);
+            ENVIRONMENT env;
+            rlt::init(device, env);
+            // nominal aerodynamics and no random cut: this flight's cut is set here
+            ENVIRONMENT::Parameters p = env.parameters;
+            p.randomization.enabled = false;
+            p.motor_cut.probability = 0;
+            whoop::set_velocity_reference(device, p, T(0), o.speed);
+            p.motor_cut.start_step = cut_start;
+            p.motor_cut.end_step = cut_end;
+            // L2F's sampler gives the random force and torque of the seed; then level at rest at the origin, with the
+            // rotors and the action history at the hover command
+            ENVIRONMENT::State s;
+            whoop::sample_initial_state(device, env, p, s, rng);
+            for(TI i = 0; i < 3; i++){ s.position[i] = 0; s.linear_velocity[i] = 0; s.angular_velocity[i] = 0; }
+            s.orientation[0] = 1; s.orientation[1] = s.orientation[2] = s.orientation[3] = 0;
+            T hover = p.dynamics.hovering_throttle_relative;
+            for(TI i = 0; i < 4; i++) s.rpm[i] = hover;
+            for(TI h = 0; h < FACTORY::ACTION_HISTORY_LENGTH; h++) for(TI i = 0; i < 4; i++) s.action_history[h][i] = whoop::action_baseline(hover);
+            Policy policy(device, actor, rng);
+            const double weight = p.dynamics.mass * 9.81;
+            double z_cut = 0, speed_cut = 0, z_min = 1e9, t_min = 0, t_arrest = -1, max_error = 0, max_tilt = 0;
+            double plate_lift_cut = 0, plate_force_cut = 0, cut_samples = 0;
+            double error_end = 0, speed_error_end = 0, max_error_last_second = 0;
+            bool falling = false;
+            for(TI step = 0; step < n_steps; step++){
+                if(step == cut_start){
+                    z_cut = s.position[2];
+                    speed_cut = norm3(s.linear_velocity);
+                }
+                rlt::observe(device, env, p, s, typename ENVIRONMENT::Observation{}, policy.observation, rng);
+                policy.act(device, actor, rng);
+                bool cut = whoop::motors_cut(p, s);
+                ENVIRONMENT::State next;
+                whoop::step(device, env, p, s, policy.action, next, rng);
+                ENVIRONMENT::State reference;
+                desired_state(device, env, p, next, reference, rng);
+                bool terminated = rlt::terminated(device, env, p, next, rng);
+                whoop::PlateAerodynamics<T> aero{};
+                if(p.plate.area > 0){
+                    whoop::plate_aerodynamics(device, p.plate, next.orientation, next.linear_velocity, next.angular_velocity, aero);
+                }
+                T command[4];
+                for(TI i = 0; i < 4; i++) command[i] = cut ? T(0) : (rlt::get(policy.action, 0, i) + 1) / 2;
+                double t = (step + 1) * dt;
+                write_flight_row(flights, k, t, next, reference, command, aero, terminated);
+                flights << "," << cut << "\n";
+                T e[3], e_v[3];
+                for(TI i = 0; i < 3; i++){ e[i] = next.position[i] - reference.position[i]; e_v[i] = next.linear_velocity[i] - reference.linear_velocity[i]; }
+                // tilt of the body z axis from the vertical: cos(tilt) = 1 - 2 (q_x^2 + q_y^2)
+                double cos_tilt = 1 - 2 * (double(next.orientation[1]) * next.orientation[1] + double(next.orientation[2]) * next.orientation[2]);
+                double tilt = std::acos(std::clamp(cos_tilt, -1.0, 1.0)) * 180 / 3.14159265358979323846;
+                if(step >= cut_start){
+                    if(next.position[2] < z_min){ z_min = next.position[2]; t_min = t; }
+                    max_error = std::max(max_error, norm3(e));
+                    max_tilt = std::max(max_tilt, tilt);
+                    if(next.linear_velocity[2] < 0) falling = true;
+                    // fall arrested: the first step after the cut at which the whoop stops going down
+                    if(step >= cut_end && t_arrest < 0 && falling && next.linear_velocity[2] >= 0) t_arrest = t - (o.cut_time + o.cut_duration);
+                }
+                if(cut && p.plate.area > 0){
+                    // the plate force in world axes: its vertical part is what holds the whoop up during the cut
+                    T f_world[3];
+                    rlt::rl::environments::l2f::rotate_vector_by_quaternion<DEVICE, T>(next.orientation, aero.force, f_world);
+                    plate_lift_cut += f_world[2] / weight;
+                    plate_force_cut += norm3(aero.force) / weight;
+                    cut_samples += 1;
+                }
+                if(t > o.duration - 1 + 1e-9) max_error_last_second = std::max(max_error_last_second, norm3(e));
+                error_end = norm3(e);
+                speed_error_end = norm3(e_v);
+                s = next;
+            }
+            // recovered: back within 0.5 m of the reference over the last second, and at its velocity (within
+            // 0.5 m/s) at the end; the policies track the line to about 0.2-0.3 m RMS without a cut
+            bool recovered = max_error_last_second < 0.5 && speed_error_end < 0.5;
+            recovered_count += recovered;
+            lost_sum += z_cut - z_min;
+            json << (k == 0 ? "" : ",") << "\n    {\"seed\": " << k << ", \"z_at_cut\": " << z_cut << ", \"speed_at_cut\": " << speed_cut
+                 << ", \"altitude_lost\": " << z_cut - z_min << ", \"lowest_z\": " << z_min << ", \"time_of_lowest_z\": " << t_min
+                 << ", \"fall_arrested_after_cut_end\": " << t_arrest << ", \"max_position_error\": " << max_error << ", \"max_tilt_deg\": " << max_tilt
+                 << ", \"mean_plate_lift_to_weight_during_cut\": " << (cut_samples > 0 ? plate_lift_cut / cut_samples : 0)
+                 << ", \"mean_plate_force_to_weight_during_cut\": " << (cut_samples > 0 ? plate_force_cut / cut_samples : 0)
+                 << ", \"max_position_error_last_second\": " << max_error_last_second << ", \"final_position_error\": " << error_end
+                 << ", \"final_velocity_error\": " << speed_error_end << ", \"recovered\": " << (recovered ? "true" : "false") << "}";
+            policy.free(device);
+            rlt::free(device, rng);
+        }
+        json << "\n  ],\n  \"mean_altitude_lost\": " << lost_sum / o.seeds << ",\n  \"recovered\": " << recovered_count << ",\n  \"flights_total\": " << o.seeds << "\n}\n";
+        return json.str();
+    }
+}
+
+// ----- command line -----------------------------------------------------------------------------------------------------
+struct Options{
+    std::filesystem::path out_dir;
+    TI seed = 0;
+    TI steps = 300000;  // L2F: 300k
+    TI eval_interval = 50000;
+    bool curriculum = true;
+    bool randomization = true;
+    T motor_cuts = 0;  // fraction of the training episodes with a motor cut
+    std::string scenario_actor;
+    ScenarioOptions scenario;
+};
+
+Options parse(int argc, char** argv){
+    Options o;
+    o.out_dir = argv[1];
+    int positional = 0;
+    auto value = [&](int& i, const std::string& option){
+        if(i + 1 >= argc) throw std::runtime_error(option + " needs a value");
+        return std::string(argv[++i]);
+    };
+    for(int i = 2; i < argc; i++){
+        std::string a = argv[i];
+        if(a.rfind("--", 0) != 0){
+            // the seed, then the number of steps
+            if(positional == 0) o.seed = std::stoul(a);
+            else if(positional == 1) o.steps = std::stoul(a);
+            else throw std::runtime_error("unexpected argument " + a);
+            positional++;
+        }
+        else if(a == "--eval-interval") o.eval_interval = std::stoul(value(i, a));
+        else if(a == "--no-curriculum") o.curriculum = false;
+        else if(a == "--no-randomization") o.randomization = false;
+        else if(a == "--motor-cuts") o.motor_cuts = std::stof(value(i, a));
+        else if(a == "--scenario") o.scenario_actor = value(i, a);
+        else if(a == "--scenario-seeds") o.scenario.seeds = std::stoul(value(i, a));
+        else if(a == "--speed") o.scenario.speed = std::stof(value(i, a));
+        else if(a == "--cut-time") o.scenario.cut_time = std::stof(value(i, a));
+        else if(a == "--cut-duration") o.scenario.cut_duration = std::stof(value(i, a));
+        else if(a == "--duration") o.scenario.duration = std::stof(value(i, a));
+        else throw std::runtime_error("unknown option " + a);
+    }
+    if(o.steps >= LOOP_CORE_PARAMETERS::STEP_LIMIT) throw std::runtime_error("steps above the compiled STEP_LIMIT");
+    if(o.eval_interval == 0) throw std::runtime_error("--eval-interval must be positive");
+    if(o.motor_cuts < 0 || o.motor_cuts > 1) throw std::runtime_error("--motor-cuts must be in [0, 1]");
+    if(o.motor_cuts > 0 && !WHOOP_TASK_VELOCITY) throw std::runtime_error("--motor-cuts needs the velocity task (the cut is timed by its reference)");
+    return o;
+}
+
+int scenario(DEVICE& device, const Options& o, const std::string& program){
+    std::ofstream(o.out_dir / "config.json") << std::setprecision(10) << "{\n  \"program\": \"" << program << "\",\n  \"mode\": \"motor_cut_scenario\",\n  \"actor\": \""
+        << std::filesystem::path(o.scenario_actor).filename().string() << "\",\n  \"seeds\": " << o.scenario.seeds << ",\n  \"speed\": " << o.scenario.speed
+        << ",\n  \"cut_time\": " << o.scenario.cut_time << ",\n  \"cut_duration\": " << o.scenario.cut_duration << ",\n  \"duration\": " << o.scenario.duration
+        << ",\n  \"plate_area\": " << FACTORY::nominal_parameters.plate.area << ",\n  \"randomization\": false\n}\n";
+    ACTOR_FORWARD actor;
+    rlt::malloc(device, actor);
+    load_actor_tar(device, actor, o.scenario_actor);
+    std::string json = motor_cut_scenario(device, actor, o.scenario, o.out_dir / "flights.csv");
+    std::ofstream(o.out_dir / "scenario.json") << json;
+    std::cout << json;
+    rlt::free(device, actor);
+    return 0;
+}
+
 int run(int argc, char** argv){
     const std::string program = std::string("whoop_train_") + (WHOOP_TD3 ? "td3" : "sac") + (WHOOP_TASK_VELOCITY ? "_velocity" : "_hover") + (WHOOP_PLATE ? "_plate" : "_noplate");
     if(argc < 2){
-        std::cerr << "usage: " << program << " <out_dir> [seed] [steps] [--eval-interval N] [--no-curriculum]" << std::endl;
+        std::cerr << "usage: " << program << " <out_dir> [seed] [steps] [--eval-interval N] [--no-curriculum] [--no-randomization] [--motor-cuts P]\n"
+                  << "       " << program << " <out_dir> --scenario <actor.tar> [--scenario-seeds N] [--speed V] [--cut-time S] [--cut-duration S] [--duration S]" << std::endl;
         return 1;
     }
-    std::filesystem::path out_dir = argv[1];
+    Options options = parse(argc, argv);
+    const std::filesystem::path& out_dir = options.out_dir;
     std::filesystem::create_directories(out_dir);
-    TI seed = argc > 2 ? std::stoul(argv[2]) : 0;
-    TI steps = argc > 3 ? std::stoul(argv[3]) : 300000;  // L2F: 300k
-    TI eval_interval = 50000;
-    bool curriculum = true;
-    for(int i = 4; i < argc; i++){
-        std::string option = argv[i];
-        if(option == "--eval-interval" && i + 1 < argc) eval_interval = std::stoul(argv[++i]);
-        else if(option == "--no-curriculum") curriculum = false;
-        else throw std::runtime_error("unknown option " + option);
+    DEVICE device;
+    rlt::init(device);
+    if(!options.scenario_actor.empty()){
+        return scenario(device, options, program);
     }
-    if(steps >= LOOP_CORE_PARAMETERS::STEP_LIMIT) throw std::runtime_error("steps above the compiled STEP_LIMIT");
-    if(eval_interval == 0) throw std::runtime_error("--eval-interval must be positive");
+    const TI seed = options.seed, steps = options.steps, eval_interval = options.eval_interval;
+    const bool curriculum = options.curriculum;
 
     const auto& nominal = FACTORY::nominal_parameters;
     std::ofstream(out_dir / "config.json") << std::setprecision(10) << "{\n  \"program\": \"" << program << "\",\n  \"seed\": " << seed
@@ -499,6 +811,12 @@ int run(int argc, char** argv){
         << (WHOOP_TASK_VELOCITY ? "velocity" : "hover") << "\",\n  \"plate\": " << (WHOOP_PLATE ? "true" : "false")
         << ",\n  \"plate_area\": " << nominal.plate.area << ",\n  \"mass\": " << nominal.dynamics.mass
         << ",\n  \"hovering_throttle\": " << nominal.dynamics.hovering_throttle_relative
+        << ",\n  \"body_drag\": [" << nominal.body_drag[0] << ", " << nominal.body_drag[1] << ", " << nominal.body_drag[2] << "]"
+        << ",\n  \"randomization\": " << (options.randomization ? "true" : "false")
+        << ",\n  \"randomization_plate\": " << nominal.randomization.plate << ",\n  \"randomization_body_drag\": " << nominal.randomization.body_drag
+        << ",\n  \"motor_cuts\": " << options.motor_cuts
+        << ",\n  \"motor_cut_start\": [" << nominal.motor_cut.start_min << ", " << nominal.motor_cut.start_max << "]"
+        << ",\n  \"motor_cut_duration\": [" << nominal.motor_cut.duration_min << ", " << nominal.motor_cut.duration_max << "]"
         << ",\n  \"observation_dim\": " << ENVIRONMENT::Observation::DIM << ",\n  \"observation_dim_privileged\": " << ENVIRONMENT::ObservationPrivileged::DIM
         << ",\n  \"action_history\": " << FACTORY::ACTION_HISTORY_LENGTH << ",\n  \"episode_steps\": " << ENVIRONMENT::EPISODE_STEP_LIMIT
         << ",\n  \"dt\": " << nominal.integration.dt << ",\n  \"actor_hidden\": [64, 64],\n  \"critic_hidden\": [64, 64],\n  \"activation\": \"fast_tanh\""
@@ -511,17 +829,22 @@ int run(int argc, char** argv){
         << ",\n  \"velocity_task_ramp_time\": " << nominal.velocity_task.ramp_time
         << ",\n  \"eval_interval\": " << eval_interval << "\n}\n";
 
-    DEVICE device;
-    rlt::init(device);
     LOOP_STATE ts;
     rlt::malloc(device, ts);
     rlt::init(device, ts, seed);
     auto& runner = ts.off_policy_runner;
+    // the training options go into the environment's parameters, from which sample_initial_parameters starts every
+    // episode (the first episode is sampled at the first step, after this)
+    auto& runner_env = rlt::get(runner.envs, 0, 0);
+    runner_env.parameters.randomization.enabled = options.randomization;
+    runner_env.parameters.motor_cut.probability = options.motor_cuts;
     // evaluation with its own random numbers: training is the same with or without it
     RNG eval_rng;
     rlt::malloc(device, eval_rng);
     rlt::init(device, eval_rng, seed + 1);
-    TestSet tests = test_set(device, 12345);
+    // the fixed test flights use the nominal aerodynamics (the same 100 starts and references as without the
+    // randomization); a second set with randomized aerodynamics is flown at the end when training randomized them
+    TestSet tests = test_set(device, 12345, false);
 
     std::ofstream progress(out_dir / "progress.csv");
     progress << "time/total_timesteps,rollout/ep_len_mean,rollout/ep_rew_mean,rollout/episodes,curriculum/position_weight,"
@@ -563,7 +886,38 @@ int run(int argc, char** argv){
     Summary s = evaluate(device, rlt::get_actor(ts), tests, eval_rng, out_dir / "flights.csv");
     std::string json = to_json(s);
     std::ofstream(out_dir / "evaluation.json") << json;
+    if(options.randomization){
+        TestSet randomized = test_set(device, 12345, true);
+        Summary r = evaluate(device, rlt::get_actor(ts), randomized, eval_rng);
+        std::ofstream(out_dir / "evaluation_randomized.json") << to_json(r);
+        std::cout << "randomized aerodynamics: success " << std::setprecision(3) << 100 * r.success_rate << " %, position RMSE (2nd half) "
+                  << r.position_rmse_last_half << " m" << std::endl;
+    }
     save_actor(device, rlt::get_actor(ts), tests, out_dir / "actor.h", program + "_seed" + std::to_string(seed) + "_" + std::to_string(steps));
+    save_actor_tar(device, rlt::get_actor(ts), out_dir / "actor.tar");
+    {
+        // the tar file must give back the same actor: the same action for the first test start
+        ACTOR_FORWARD loaded, original;
+        rlt::malloc(device, loaded);
+        rlt::malloc(device, original);
+        rlt::copy(device, device, rlt::get_actor(ts), original);
+        load_actor_tar(device, loaded, out_dir / "actor.tar");
+        ENVIRONMENT env;
+        rlt::init(device, env);
+        Policy a(device, original, eval_rng), b(device, loaded, eval_rng);
+        rlt::observe(device, env, tests.parameters[0], tests.starts[0], typename ENVIRONMENT::Observation{}, a.observation, eval_rng);
+        rlt::copy(device, device, a.observation, b.observation);
+        a.act(device, original, eval_rng);
+        b.act(device, loaded, eval_rng);
+        double diff = 0;
+        for(TI i = 0; i < ENVIRONMENT::ACTION_DIM; i++) diff = std::max(diff, (double)std::abs(rlt::get(a.action, 0, i) - rlt::get(b.action, 0, i)));
+        std::cout << "actor.tar read back: max action difference " << diff << std::endl;
+        if(diff > 1e-6) throw std::runtime_error("actor.tar does not reproduce the actor");
+        a.free(device);
+        b.free(device);
+        rlt::free(device, loaded);
+        rlt::free(device, original);
+    }
     std::cout << json << "training seconds: " << seconds << std::endl;
     rlt::free(device, eval_rng);
     rlt::free(device, ts);

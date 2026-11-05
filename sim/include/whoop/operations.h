@@ -5,10 +5,13 @@
 // finds functions in the namespace of the parameter type, here whoop. Each overload below takes ParametersWhoop<...>&
 // where L2F takes any PARAMETERS&, so C++ prefers it (more specialized), and it calls back into L2F's own code for
 // everything it does not change. The overloads are:
-//   multirotor_dynamics  L2F's rigid-body and rotor equations, then + the plate force and torque when S > 0
-//   sample_initial_parameters  L2F's, then the plate and task parameters, and the velocity reference of the episode
+//   multirotor_dynamics  L2F's rigid-body and rotor equations, then + the body drag (whoop/body_drag.h) and the plate
+//                        force and torque when S > 0
+//   sample_initial_parameters  L2F's, then the plate, drag and task parameters, the randomization of the aerodynamics,
+//                              the velocity reference and the motor cut of the episode
 //   sample_initial_state  L2F's (rotors, action history, random force), then the rigid-body initial state of the L2F
 //                         paper: the current RLtools samples the tilt uniformly in [0, 1] rad whatever max_angle says
+//   step                 L2F's, with the motor commands forced to 0 during a motor cut
 //   reward, log_reward  the reward of the L2F paper (Reward in environment.h)
 // Include this after <rl_tools/operations/cpu_mux.h> (or another device), as any RLtools environment.
 #pragma once
@@ -24,35 +27,49 @@ namespace whoop{
     template <typename DEVICE, typename STATE_SPEC, typename WHOOP_SPEC, typename T>
     RL_TOOLS_FUNCTION_PLACEMENT void multirotor_dynamics(DEVICE& device, const ParametersWhoop<WHOOP_SPEC>& params, const l2f::StateBase<STATE_SPEC>& state, const T* action, l2f::StateBase<STATE_SPEC>& state_change){
         // L2F's equations with the L2F part of the parameters (exactly the same code and numbers as without the plate)
+        using TI = typename DEVICE::index_t;
         using L2F_PARAMETERS = typename WHOOP_SPEC::NEXT_COMPONENT;
         l2f::multirotor_dynamics(device, static_cast<const L2F_PARAMETERS&>(params), state, action, state_change);
-        if(params.plate.area > 0){
+        bool plate = params.plate.area > 0;
+        bool drag = params.body_drag[0] > 0 || params.body_drag[1] > 0 || params.body_drag[2] > 0;
+        // with neither, nothing is added: the code path is L2F's alone (the tests check it bit for bit)
+        if(plate || drag){
             // L2F sums the rotor forces and torques in the body frame, then a = R F / m + g and
-            // domega/dt = J^-1 (tau - omega x J omega). Both are linear in F and tau, so adding R F_plate / m and
-            // J^-1 tau_plate afterwards is the same as adding the plate to L2F's sums (up to rounding)
+            // domega/dt = J^-1 (tau - omega x J omega). Both are linear in F and tau, so adding R F_aero / m and
+            // J^-1 tau_aero afterwards is the same as adding the aerodynamics to L2F's sums (up to rounding)
+            T force_body[3] = {0, 0, 0};
+            if(drag){
+                // at the centre of mass: a force, no torque
+                body_drag_force(device, params.body_drag, state.orientation, state.linear_velocity, params.plate.wind, force_body);
+            }
             PlateAerodynamics<T> aero;
-            plate_aerodynamics(device, params.plate, state.orientation, state.linear_velocity, state.angular_velocity, aero);
+            if(plate){
+                plate_aerodynamics(device, params.plate, state.orientation, state.linear_velocity, state.angular_velocity, aero);
+                for(TI i = 0; i < 3; i++){
+                    force_body[i] += aero.force[i];
+                }
+            }
             T force_world[3];
-            l2f::rotate_vector_by_quaternion<DEVICE, T>(state.orientation, aero.force, force_world);
-            for(typename DEVICE::index_t i = 0; i < 3; i++){
+            l2f::rotate_vector_by_quaternion<DEVICE, T>(state.orientation, force_body, force_world);
+            for(TI i = 0; i < 3; i++){
                 state_change.linear_velocity[i] += force_world[i] / params.dynamics.mass;
             }
-            T angular_acceleration[3];
-            rl_tools::utils::vector_operations::matrix_vector_product<DEVICE, T, 3, 3>(params.dynamics.J_inv, aero.torque, angular_acceleration);
-            rl_tools::utils::vector_operations::add_accumulate<DEVICE, T, 3>(angular_acceleration, state_change.angular_velocity);
+            if(plate){
+                T angular_acceleration[3];
+                rl_tools::utils::vector_operations::matrix_vector_product<DEVICE, T, 3, 3>(params.dynamics.J_inv, aero.torque, angular_acceleration);
+                rl_tools::utils::vector_operations::add_accumulate<DEVICE, T, 3>(angular_acceleration, state_change.angular_velocity);
+            }
         }
     }
 
-    template <typename DEVICE, typename WHOOP_SPEC, typename RNG>
-    void sample_velocity_reference(DEVICE& device, ParametersWhoop<WHOOP_SPEC>& parameters, RNG& rng){
-        // horizontal straight line through the start, random heading and speed; the reference accelerates uniformly
-        // from rest during ramp_time so that a start near hover can follow it [assumption: horizontal only]
+    template <typename DEVICE, typename WHOOP_SPEC>
+    void set_velocity_reference(DEVICE& device, ParametersWhoop<WHOOP_SPEC>& parameters, typename WHOOP_SPEC::T heading, typename WHOOP_SPEC::T speed){
+        // horizontal straight line through the origin at the given heading [rad] and speed [m/s]; the reference
+        // accelerates uniformly from rest during ramp_time so that a start near hover can follow it
         using T = typename WHOOP_SPEC::T;
         using TI = typename DEVICE::index_t;
         using TRAJECTORY = decltype(parameters.trajectory);
         const auto& task = parameters.velocity_task;
-        T heading = rlt::random::uniform_real_distribution(typename DEVICE::SPEC::RANDOM(), (T)0, 2 * rlt::math::PI<T>, rng);
-        T speed = rlt::random::uniform_real_distribution(typename DEVICE::SPEC::RANDOM(), task.speed_min, task.speed_max, rng);
         T direction[2] = {rlt::math::cos(device.math, heading), rlt::math::sin(device.math, heading)};
         for(TI step_i = 0; step_i < TRAJECTORY::LENGTH; step_i++){
             T t = step_i * TRAJECTORY::DT;
@@ -77,15 +94,107 @@ namespace whoop{
         }
     }
 
+    template <typename DEVICE, typename WHOOP_SPEC, typename RNG>
+    void sample_velocity_reference(DEVICE& device, ParametersWhoop<WHOOP_SPEC>& parameters, RNG& rng){
+        // random heading and speed [assumption: horizontal only]
+        using T = typename WHOOP_SPEC::T;
+        const auto& task = parameters.velocity_task;
+        T heading = rlt::random::uniform_real_distribution(typename DEVICE::SPEC::RANDOM(), (T)0, 2 * rlt::math::PI<T>, rng);
+        T speed = rlt::random::uniform_real_distribution(typename DEVICE::SPEC::RANDOM(), task.speed_min, task.speed_max, rng);
+        set_velocity_reference(device, parameters, heading, speed);
+    }
+
+    template <typename DEVICE, typename WHOOP_SPEC, typename RNG>
+    void sample_aerodynamics(DEVICE& device, ParametersWhoop<WHOOP_SPEC>& parameters, RNG& rng){
+        // one independent factor U(1 - r, 1 + r) per coefficient. The plate geometry (S, c_x, c_z, r_c) is measured,
+        // so only the coefficients that the identification has to estimate are randomized
+        using T = typename WHOOP_SPEC::T;
+        const auto& r = parameters.randomization;
+        auto factor = [&](T range){
+            return rlt::random::uniform_real_distribution(typename DEVICE::SPEC::RANDOM(), 1 - range, 1 + range, rng);
+        };
+        auto& plate = parameters.plate;
+        plate.CN90 *= factor(r.plate);
+        plate.Kp_x *= factor(r.plate);
+        plate.Kp_z *= factor(r.plate);
+        plate.CT *= factor(r.plate);
+        plate.e0 *= factor(r.plate);
+        for(int i = 0; i < 3; i++){
+            parameters.body_drag[i] *= factor(r.body_drag);
+        }
+    }
+
+    template <typename DEVICE, typename WHOOP_SPEC, typename RNG>
+    void sample_motor_cut(DEVICE& device, ParametersWhoop<WHOOP_SPEC>& parameters, RNG& rng){
+        using T = typename WHOOP_SPEC::T;
+        using TI = typename WHOOP_SPEC::TI;
+        auto& cut = parameters.motor_cut;
+        typename DEVICE::SPEC::RANDOM random;
+        cut.start_step = 0;
+        cut.end_step = 0;
+        if(rlt::random::uniform_real_distribution(random, (T)0, (T)1, rng) < cut.probability){
+            T start = rlt::random::uniform_real_distribution(random, cut.start_min, cut.start_max, rng);
+            T duration = rlt::random::uniform_real_distribution(random, cut.duration_min, cut.duration_max, rng);
+            T dt = parameters.integration.dt;
+            cut.start_step = (TI)(start / dt + (T)0.5);
+            cut.end_step = (TI)((start + duration) / dt + (T)0.5);
+        }
+    }
+
     template <typename DEVICE, typename SPEC, typename WHOOP_SPEC, typename RNG>
     void sample_initial_parameters(DEVICE& device, rlt::rl::environments::Multirotor<SPEC>& env, ParametersWhoop<WHOOP_SPEC>& parameters, RNG& rng){
         rlt::sample_initial_parameters(device, env, static_cast<typename WHOOP_SPEC::NEXT_COMPONENT&>(parameters), rng);
-        // no domain randomization of the plate yet: the nominal values of the environment (L2F: none either)
         parameters.plate = env.parameters.plate;
         parameters.velocity_task = env.parameters.velocity_task;
+        for(int i = 0; i < 3; i++){
+            parameters.body_drag[i] = env.parameters.body_drag[i];
+        }
+        parameters.randomization = env.parameters.randomization;
+        parameters.motor_cut = env.parameters.motor_cut;
         if constexpr(WHOOP_SPEC::TASK == Task::VELOCITY){
             sample_velocity_reference(device, parameters, rng);
         }
+        // random numbers are drawn only for the options that are on, so that with both off the episodes (and the
+        // fixed test flights of train.cpp) are the same as without these options
+        if(parameters.randomization.enabled){
+            sample_aerodynamics(device, parameters, rng);
+        }
+        parameters.motor_cut.start_step = 0;
+        parameters.motor_cut.end_step = 0;
+        if constexpr(WHOOP_SPEC::TASK == Task::VELOCITY){
+            // the cut is timed by the trajectory step, which only the velocity task has
+            if(parameters.motor_cut.probability > 0){
+                sample_motor_cut(device, parameters, rng);
+            }
+        }
+    }
+
+    template <typename WHOOP_SPEC, typename STATE>
+    RL_TOOLS_FUNCTION_PLACEMENT bool motors_cut(const ParametersWhoop<WHOOP_SPEC>& parameters, const STATE& state){
+        // true while the episode's motor cut is on, for the step from this state
+        if constexpr(WHOOP_SPEC::TASK == Task::VELOCITY){
+            return state.trajectory_step >= parameters.motor_cut.start_step && state.trajectory_step < parameters.motor_cut.end_step;
+        }
+        else{
+            return false;
+        }
+    }
+
+    template <typename DEVICE, typename SPEC, typename WHOOP_SPEC, typename STATE, typename ACTION_SPEC, typename RNG>
+    RL_TOOLS_FUNCTION_PLACEMENT typename SPEC::T step(DEVICE& device, const rlt::rl::environments::Multirotor<SPEC>& env, ParametersWhoop<WHOOP_SPEC>& parameters, const STATE& state, const rlt::Matrix<ACTION_SPEC>& action, STATE& next_state, RNG& rng){
+        // L2F's step, except during a motor cut: then every command is -1 (motor command 0) whatever the policy asks.
+        // The forced command also goes into the action history, as it would on the drone, where the flight controller
+        // knows that the motors are off; the replay buffer and the reward keep the policy's own action
+        using T = typename SPEC::T;
+        using TI = typename DEVICE::index_t;
+        if(motors_cut(parameters, state)){
+            rlt::Matrix<rlt::matrix::Specification<T, TI, 1, ACTION_SPEC::COLS, false>> off;
+            for(TI i = 0; i < ACTION_SPEC::COLS; i++){
+                rlt::set(off, 0, i, (T)-1);
+            }
+            return rlt::step(device, env, parameters, state, off, next_state, rng);
+        }
+        return rlt::step(device, env, parameters, state, action, next_state, rng);
     }
 
     template <typename DEVICE, typename T, typename TI, typename INIT, typename STATE_SPEC, typename RNG>

@@ -4,9 +4,10 @@
 //
 // The RLtools checkout is not modified. L2F composes its parameters as a chain of structs (ParametersBase,
 // ParametersDisturbances, ...) and dispatches its operations on the types of that chain. This file adds one more link
-// on top, ParametersWhoop, which carries the plate and the task; whoop/operations.h then overloads the few L2F
-// operations that must change for that type (dynamics, initial state, reward). Everything else (integration, rotor
-// model, observations, termination, disturbances) is L2F's own code.
+// on top, ParametersWhoop, which carries the plate, the body drag, the task, the randomization of the aerodynamics and
+// the optional motor cuts; whoop/operations.h then overloads the few L2F operations that must change for that type
+// (dynamics, parameters, initial state, step, reward). Everything else (integration, rotor model, observations,
+// termination, disturbances) is L2F's own code.
 //
 // Two tasks:
 //   HOVER    L2F's position hold at the origin from random initial states (the paper's task)
@@ -19,6 +20,7 @@
 
 #include <whoop/params.h>  // generated from params/whoop_nominal.json (tools/generate_params.py)
 #include <whoop/plate.h>
+#include <whoop/body_drag.h>
 
 namespace whoop{
     namespace l2f = rl_tools::rl::environments::l2f;
@@ -53,6 +55,30 @@ namespace whoop{
         T ramp_time;  // [s] the reference accelerates uniformly from rest to the speed in this time
     };
 
+    // domain randomization of the aerodynamics, drawn once per episode in sample_initial_parameters (whoop/operations.h):
+    // each coefficient is multiplied by its own factor from U(1 - r, 1 + r). The plate coefficients and the body drag
+    // are priors until the real drone is identified, so the policy should not depend on their exact values
+    template <typename T>
+    struct Randomization{
+        bool enabled;
+        T plate;      // r for C_N90, K_px, K_pz, C_T and e0
+        T body_drag;  // r for each of the three drag components
+    };
+
+    // training option: in a fraction of the episodes of the velocity task all motor commands are forced to 0 for a
+    // while, so that the policy learns to recover. The episode's cut is drawn in sample_initial_parameters (or set by
+    // the motor-cut scenario of train.cpp); the motors are off while start_step <= trajectory step < end_step
+    template <typename T, typename TI>
+    struct MotorCut{
+        T probability;   // of a cut in an episode; 0 = never
+        T start_min;     // [s] start time U(start_min, start_max)
+        T start_max;
+        T duration_min;  // [s] duration U(duration_min, duration_max)
+        T duration_max;
+        TI start_step;   // this episode's cut, in simulation steps (start_step == end_step: no cut)
+        TI end_step;
+    };
+
     template <typename T_T, typename T_TI, Task T_TASK, typename T_NEXT_COMPONENT>
     struct ParametersWhoopSpecification{
         using T = T_T;
@@ -68,6 +94,11 @@ namespace whoop{
         static constexpr Task TASK = WHOOP_SPEC::TASK;
         Plate<typename WHOOP_SPEC::T> plate;
         VelocityTask<typename WHOOP_SPEC::T> velocity_task;
+        // linear drag of the whoop body, F = -diag(body_drag) v_rel in the body frame [kg/s] (whoop/body_drag.h); it
+        // sees the same air as the plate (plate.wind)
+        typename WHOOP_SPEC::T body_drag[3];
+        Randomization<typename WHOOP_SPEC::T> randomization;
+        MotorCut<typename WHOOP_SPEC::T, typename WHOOP_SPEC::TI> motor_cut;
     };
 
     // L2F observations are tagged privileged (noise-free for the critic) through their specification; the trajectory
@@ -228,7 +259,12 @@ namespace whoop{
 
         static constexpr L2F_PARAMETERS l2f_nominal_parameters = make_l2f_parameters<T, TI, PLATE, VELOCITY, L2F_PARAMETERS>();
         static constexpr VelocityTask<T> velocity_task = {1, 4, 1};  // [assumption] speed range and ramp
-        static constexpr PARAMETERS nominal_parameters = {l2f_nominal_parameters, whoop_plate<T, PLATE>(), velocity_task};
+        // randomization on by default (train.cpp --no-randomization turns it off); no motor cuts unless asked for,
+        // and then 0.2-0.5 s cuts starting after the 1 s ramp, early enough to leave time to recover [assumption]
+        static constexpr Randomization<T> randomization = {true, (T)params::randomization::plate, (T)params::randomization::body_drag};
+        static constexpr MotorCut<T, TI> motor_cut = {0, (T)1.0, (T)4.0, (T)0.2, (T)0.5, 0, 0};
+        static constexpr PARAMETERS nominal_parameters = {l2f_nominal_parameters, whoop_plate<T, PLATE>(), velocity_task,
+            {(T)params::body_drag[0], (T)params::body_drag[1], (T)params::body_drag[2]}, randomization, motor_cut};
 
         // state: L2F's rigid body, random force, rotor speeds (first-order motors) and the action history; the
         // velocity task adds the trajectory step

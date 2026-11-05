@@ -12,6 +12,8 @@ Besides copying the values, the script derives what L2F needs and the JSON does 
     (3 mm x 0.0078 m^2 x about 30 kg/m^3 = 0.7 g), the sheet as a thin rectangle c_x x c_z in the body x-z plane with
     its centroid at plate.centroid relative to the centre of mass of the whole vehicle, and the whoop's own J taken
     about its own centre of mass (parallel-axis terms for both parts).
+It also checks the body drag (non-negative) and the randomization ranges (r in [0, 1), so that every factor stays
+positive).
 """
 import json
 import math
@@ -82,6 +84,14 @@ def main():
         fail("downwash_factor != 0 is not implemented (docs/plate_model.md: k_w = 0 for now)")
     if any(len(r) != 3 for r in w["rotor_positions"]) or len(w["rotor_positions"]) != 4:
         fail("expected 4 rotors")
+    body_drag = w["body_drag"]
+    if len(body_drag) != 3 or any(d < 0 for d in body_drag):
+        fail("body_drag must be 3 non-negative values (kg/s, body x, y, z)")
+    randomization = p["randomization"]
+    for key in ("plate", "body_drag"):
+        # a factor U(1 - r, 1 + r) must stay positive, or a coefficient would change sign
+        if not 0 <= randomization[key] < 1:
+            fail("randomization.%s must be in [0, 1)" % key)
 
     gravity = w["gravity"][2]
     J = w["J"]
@@ -114,6 +124,11 @@ def main():
     out.append("    constexpr double J[3][3] = %s;" % cpp(J))
     out.append("    constexpr double J_inv[3][3] = %s;" % cpp(inverse3(J)))
     out.append("    constexpr double hovering_throttle = %s;" % cpp(hover_command(coefficients, m_whoop, gravity)))
+    out.append("    constexpr double body_drag[3] = %s;  // kg/s: F = -diag(d) v_rel, body frame" % cpp(body_drag))
+    out.append("    namespace randomization{")
+    out.append("        constexpr double plate = %s;  // factors U(1 - r, 1 + r)" % cpp(randomization["plate"]))
+    out.append("        constexpr double body_drag = %s;" % cpp(randomization["body_drag"]))
+    out.append("    }")
     out.append("    namespace plate{")
     out.append("        constexpr double area = %s;" % cpp(plate["area"]))
     out.append("        constexpr double chord_x = %s;" % cpp(c_x))

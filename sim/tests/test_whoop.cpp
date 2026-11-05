@@ -1,5 +1,6 @@
-// Unit tests of the whoop environment: the plate model against docs/plate_model.md, its place in the dynamics, and that
-// the environment is L2F's when the plate is off.
+// Unit tests of the whoop environment: the plate model against docs/plate_model.md, the body drag, their place in the
+// dynamics, the randomization of the aerodynamics, the motor cut, and that the environment is L2F's when the plate and
+// the drag are off.
 //
 // whoop_test   (exit code 0 if every check passes; prints each check with its numbers)
 #include <rl_tools/operations/cpu_mux.h>
@@ -116,8 +117,10 @@ void test_pure_wind(DEVICE& device){
     // 3. the plate in the equations of motion: with and without it, the derivatives differ by R F / m and J^-1 tau
     using ENV = F_HOVER_PLATE::ENVIRONMENT;
     using STATE_BASE = rlt::rl::environments::l2f::StateBase<rlt::rl::environments::l2f::StateSpecification<double, TI>>;
-    ENV::Parameters with = F_HOVER_PLATE::nominal_parameters, without = with;
+    // the body drag is on in both and sees the same wind (plate.wind), so the difference is the plate alone
+    ENV::Parameters with = F_HOVER_PLATE::nominal_parameters;
     with.plate = plate;
+    ENV::Parameters without = with;
     without.plate.area = 0;
     STATE_BASE s{}, d_with{}, d_without{};
     for(int i = 0; i < 4; i++) s.orientation[i] = q[i];
@@ -185,10 +188,180 @@ void test_roll_damping(DEVICE& device){
     }
 }
 
+void test_body_drag(DEVICE& device){
+    // the body drag F = -diag(d) R^T (v - wind) of sysid/model.py: as a function, then in the equations of motion
+    using ENV = F_HOVER_PLATE::ENVIRONMENT;
+    using STATE_BASE = rlt::rl::environments::l2f::StateBase<rlt::rl::environments::l2f::StateSpecification<double, TI>>;
+    ENV::Parameters with = F_HOVER_PLATE::nominal_parameters;
+    const double* d = with.body_drag;
+    // 1. level whoop at 3 m/s forward in still air: F = (-3 d_x, 0, 0), 8 % of the weight for the nominal d_x
+    const double identity[4] = {1, 0, 0, 0}, forward[3] = {3, 0, 0}, still[3] = {0, 0, 0};
+    double F[3];
+    whoop::body_drag_force(device, d, identity, forward, still, F);
+    check(d[0] == 0.008 && d[1] == 0.008 && d[2] == 0.004 && std::fabs(F[0] + 3 * d[0]) < 1e-15 && F[1] == 0 && F[2] == 0,
+          "body drag at 3 m/s forward: F = -d_x v", "F_x " + numbers({F[0]}) + " N, " + numbers({-F[0] / (with.dynamics.mass * 9.81)}) +
+          " of the weight, d = " + numbers({d[0], d[1], d[2]}) + " kg/s");
+    // 2. rotated, moving whoop in wind, plate off: the derivatives change by R F / m exactly, and nothing else
+    with.plate.area = 0;
+    with.plate.wind[0] = -1.0; with.plate.wind[1] = 0.6; with.plate.wind[2] = 0.3;
+    ENV::Parameters without = with;
+    for(int i = 0; i < 3; i++) without.body_drag[i] = 0;
+    double angle = 0.9, axis[3] = {-0.4, 0.7, 0.2};
+    double q[4] = {std::cos(angle / 2), 0, 0, 0};
+    for(int i = 0; i < 3; i++) q[i + 1] = std::sin(angle / 2) * axis[i] / norm3(axis);
+    double v_world[3] = {2.1, -1.3, 0.8}, omega[3] = {0.5, 1.5, -0.7};
+    const double w = q[0], x = q[1], y = q[2], z = q[3];
+    const double R[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)},
+                            {2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)},
+                            {2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)}};
+    double rel[3], v_body[3], F_expected[3];
+    for(int i = 0; i < 3; i++) rel[i] = v_world[i] - with.plate.wind[i];
+    for(int i = 0; i < 3; i++) v_body[i] = R[0][i] * rel[0] + R[1][i] * rel[1] + R[2][i] * rel[2];  // R^T
+    for(int i = 0; i < 3; i++) F_expected[i] = -d[i] * v_body[i];
+    whoop::body_drag_force(device, d, q, v_world, with.plate.wind, F);
+    double dF = max_abs_diff(F, F_expected, 3);
+    STATE_BASE s{}, d_with{}, d_without{};
+    for(int i = 0; i < 4; i++) s.orientation[i] = q[i];
+    for(int i = 0; i < 3; i++){ s.position[i] = 0.2 * i; s.linear_velocity[i] = v_world[i]; s.angular_velocity[i] = omega[i]; }
+    double rpm[4] = {0.5, 0.42, 0.47, 0.51};
+    whoop::multirotor_dynamics(device, with, s, rpm, d_with);
+    whoop::multirotor_dynamics(device, without, s, rpm, d_without);
+    double da[3], da_expected[3];
+    for(int i = 0; i < 3; i++){
+        da_expected[i] = (R[i][0] * F_expected[0] + R[i][1] * F_expected[1] + R[i][2] * F_expected[2]) / with.dynamics.mass;
+        da[i] = d_with.linear_velocity[i] - d_without.linear_velocity[i];
+    }
+    double dw = max_abs_diff(d_with.angular_velocity, d_without.angular_velocity, 3);
+    double dpos = max_abs_diff(d_with.position, d_without.position, 3), dq = max_abs_diff(d_with.orientation, d_without.orientation, 4);
+    check(dF < 1e-17 && max_abs_diff(da, da_expected, 3) < 1e-14 && norm3(da) > 0.1 && dw == 0 && dpos == 0 && dq == 0,
+          "body drag in the dynamics: R (-diag(d) R^T (v - wind)) / m, no torque",
+          "|F| " + numbers({norm3(F)}) + " N, max diff F " + numbers({dF}) + ", dv/dt diff " + numbers({norm3(da), max_abs_diff(da, da_expected, 3)}) +
+          ", domega/dt diff " + numbers({dw}));
+}
+
+void test_randomization(DEVICE& device){
+    // per-episode factors U(1 - r, 1 + r) on C_N90, K_px, K_pz, C_T, e0 and each drag component; off gives the nominal
+    // values, and the plate geometry is never changed
+    using FACTORY = whoop::EnvironmentFactory<double, TI, true, whoop::Task::VELOCITY>;
+    using ENV = typename FACTORY::ENVIRONMENT;
+    ENV env;
+    rlt::init(device, env);
+    const auto& nominal = FACTORY::nominal_parameters;
+    typename ENV::Parameters parameters = nominal;
+    RNG rng;
+    rlt::malloc(device, rng);
+    rlt::init(device, rng, 21);
+    const int N = 4000;
+    const double r_plate = nominal.randomization.plate, r_drag = nominal.randomization.body_drag;
+    double lo[8], hi[8], mean[8];
+    for(int j = 0; j < 8; j++){ lo[j] = 1e9; hi[j] = -1e9; mean[j] = 0; }
+    bool geometry_same = true;
+    for(int k = 0; k < N; k++){
+        whoop::sample_initial_parameters(device, env, parameters, rng);
+        const auto& p = parameters.plate;
+        double f[8] = {p.CN90 / nominal.plate.CN90, p.Kp_x / nominal.plate.Kp_x, p.Kp_z / nominal.plate.Kp_z, p.CT / nominal.plate.CT,
+                       p.e0 / nominal.plate.e0, parameters.body_drag[0] / nominal.body_drag[0], parameters.body_drag[1] / nominal.body_drag[1],
+                       parameters.body_drag[2] / nominal.body_drag[2]};
+        for(int j = 0; j < 8; j++){ lo[j] = std::min(lo[j], f[j]); hi[j] = std::max(hi[j], f[j]); mean[j] += f[j] / N; }
+        geometry_same &= p.area == nominal.plate.area && p.chord_x == nominal.plate.chord_x && p.centroid[2] == nominal.plate.centroid[2];
+    }
+    bool in_range = true, mean_one = true, spread = true;
+    double worst_mean = 0;
+    for(int j = 0; j < 8; j++){
+        double r = j < 5 ? r_plate : r_drag;
+        in_range &= lo[j] >= 1 - r && hi[j] <= 1 + r;
+        spread &= lo[j] < 1 - 0.95 * r && hi[j] > 1 + 0.95 * r;
+        // standard error of the mean of U(1 - r, 1 + r) over N draws: r / sqrt(3 N), about 0.004 for r = 0.5
+        mean_one &= std::fabs(mean[j] - 1) < 4 * r / std::sqrt(3.0 * N);
+        worst_mean = std::max(worst_mean, std::fabs(mean[j] - 1));
+    }
+    check(in_range && spread && mean_one && geometry_same && r_plate == 0.4 && r_drag == 0.5, "randomization: factors in U(1 - r, 1 + r), mean 1",
+          numbers({double(N)}) + " episodes, r = " + numbers({r_plate, r_drag}) + ", C_N90 factor in [" + numbers({lo[0], hi[0]}) + "], d_x factor in [" +
+          numbers({lo[5], hi[5]}) + "], max |mean - 1| " + numbers({worst_mean}));
+    // disabled: the nominal values exactly, and the same episodes (references) as with no randomization at all
+    env.parameters.randomization.enabled = false;
+    RNG rng_a, rng_b;
+    rlt::malloc(device, rng_a);
+    rlt::malloc(device, rng_b);
+    rlt::init(device, rng_a, 22);
+    rlt::init(device, rng_b, 22);
+    bool nominal_values = true, same_reference = true;
+    for(int k = 0; k < 50; k++){
+        whoop::sample_initial_parameters(device, env, parameters, rng_a);
+        const auto& p = parameters.plate;
+        nominal_values &= p.CN90 == nominal.plate.CN90 && p.Kp_x == nominal.plate.Kp_x && p.Kp_z == nominal.plate.Kp_z && p.CT == nominal.plate.CT &&
+                          p.e0 == nominal.plate.e0 && parameters.body_drag[0] == nominal.body_drag[0] && parameters.body_drag[1] == nominal.body_drag[1] &&
+                          parameters.body_drag[2] == nominal.body_drag[2];
+        typename ENV::Parameters reference = nominal;
+        rlt::sample_initial_parameters(device, env, static_cast<typename ENV::Parameters::NEXT_COMPONENT&>(reference), rng_b);
+        whoop::sample_velocity_reference(device, reference, rng_b);
+        same_reference &= std::memcmp(&reference.trajectory, &parameters.trajectory, sizeof(reference.trajectory)) == 0;
+    }
+    check(nominal_values && same_reference, "randomization off: nominal coefficients, no extra random numbers",
+          "50 episodes, references identical to the sampler without randomization");
+    rlt::free(device, rng);
+    rlt::free(device, rng_a);
+    rlt::free(device, rng_b);
+}
+
+void test_motor_cut(DEVICE& device){
+    // a motor cut forces every command to 0 between its start and end steps: the rotors spin down with the falling
+    // time constant, the action history records the forced command, and outside the cut the step is L2F's
+    using FACTORY = whoop::EnvironmentFactory<double, TI, true, whoop::Task::VELOCITY>;
+    using ENV = typename FACTORY::ENVIRONMENT;
+    ENV env;
+    rlt::init(device, env);
+    typename ENV::Parameters parameters = FACTORY::nominal_parameters;
+    parameters.randomization.enabled = false;
+    RNG rng;
+    rlt::malloc(device, rng);
+    rlt::init(device, rng, 9);
+    whoop::set_velocity_reference(device, parameters, 0.0, 3.0);
+    parameters.motor_cut.start_step = 10;
+    parameters.motor_cut.end_step = 50;
+    typename ENV::State s;
+    whoop::sample_initial_state(device, env, parameters, s, rng);
+    for(int i = 0; i < 4; i++) s.rpm[i] = parameters.dynamics.hovering_throttle_relative;
+    rlt::Matrix<rlt::matrix::Specification<double, TI, 1, 4>> action;
+    rlt::malloc(device, action);
+    for(TI i = 0; i < 4; i++) rlt::set(action, 0, i, 0.5);  // the policy asks for more than hover all along
+    int cut_steps = 0, history_forced = 0, same_outside = 0, outside = 0;
+    double rpm_at_start = 0, rpm_at_end = 0, rpm_expected = 0;
+    for(int step = 0; step < 80; step++){
+        bool cut = whoop::motors_cut(parameters, s);
+        if(step == 10) rpm_at_start = s.rpm[0];
+        cut_steps += cut;
+        typename ENV::State next, next_l2f;
+        auto rng_copy = rng;
+        whoop::step(device, env, parameters, s, action, next, rng);
+        rlt::step(device, env, parameters, s, action, next_l2f, rng_copy);  // L2F's own step, never cut
+        TI last = (next.rotor_history_step + FACTORY::ACTION_HISTORY_LENGTH - 1) % FACTORY::ACTION_HISTORY_LENGTH;
+        if(cut){
+            history_forced += next.action_history[last][0] == -1;
+        }
+        else{
+            outside++;
+            same_outside += std::memcmp(&next, &next_l2f, sizeof(next)) == 0;
+        }
+        if(step == 49){
+            // first-order lag toward 0 during 40 steps of 10 ms: rpm = rpm_0 exp(-0.4 / tau_falling) (RK4: to 1e-6)
+            rpm_at_end = next.rpm[0];
+            rpm_expected = rpm_at_start * std::exp(-0.4 / parameters.dynamics.rotor_time_constants_falling[0]);
+        }
+        s = next;
+    }
+    check(cut_steps == 40 && history_forced == 40 && same_outside == outside && rpm_at_start > 0.5 && std::fabs(rpm_at_end - rpm_expected) < 1e-5,
+          "motor cut: commands 0 from step 10 to 49, L2F's step outside",
+          numbers({double(cut_steps)}) + " cut steps, rotor state at the end " + numbers({rpm_at_end, rpm_expected}) + ", " +
+          numbers({double(same_outside), double(outside)}) + " steps identical to L2F outside the cut");
+    rlt::free(device, action);
+    rlt::free(device, rng);
+}
+
 template <typename T, bool PLATE, whoop::Task TASK>
 void test_same_as_l2f(DEVICE& device, const std::string& name){
-    // with S = 0, a step of the whoop environment equals a step of the plain L2F environment bit for bit (same
-    // parameter values, no whoop overloads on the L2F side)
+    // with S = 0 and no body drag, a step of the whoop environment equals a step of the plain L2F environment bit for
+    // bit (same parameter values, no whoop overloads on the L2F side)
     using FACTORY = whoop::EnvironmentFactory<T, TI, PLATE, TASK>;
     using ENV = typename FACTORY::ENVIRONMENT;
     using ENV_L2F = typename FACTORY::ENVIRONMENT_L2F;
@@ -199,6 +372,7 @@ void test_same_as_l2f(DEVICE& device, const std::string& name){
     rlt::init(device, env_l2f);
     typename ENV::Parameters parameters = FACTORY::nominal_parameters;
     parameters.plate.area = 0;
+    for(int i = 0; i < 3; i++) parameters.body_drag[i] = 0;
     typename ENV_L2F::Parameters parameters_l2f = FACTORY::l2f_nominal_parameters;
     RNG rng, rng_a, rng_b;
     rlt::malloc(device, rng);
@@ -223,7 +397,7 @@ void test_same_as_l2f(DEVICE& device, const std::string& name){
             rng_b = rng;
             typename ENV::State next;
             typename ENV_L2F::State next_l2f;
-            rlt::step(device, env, parameters, s, action, next, rng_a);
+            whoop::step(device, env, parameters, s, action, next, rng_a);  // the whoop step (no motor cut)
             rlt::step(device, env_l2f, parameters_l2f, s_l2f, action, next_l2f, rng_b);
             different += std::memcmp(&next, &next_l2f, sizeof(next)) != 0;
             n++;
@@ -233,7 +407,7 @@ void test_same_as_l2f(DEVICE& device, const std::string& name){
             rng = rng_a;
         }
     }
-    check(different == 0, "S = 0 equals plain L2F, " + name, numbers({double(n)}) + " random steps, " + numbers({double(different)}) + " different, max speed " + numbers({max_v}) + " m/s");
+    check(different == 0, "S = 0 and no body drag equals plain L2F, " + name, numbers({double(n)}) + " random steps, " + numbers({double(different)}) + " different, max speed " + numbers({max_v}) + " m/s");
     rlt::free(device, action);
     rlt::free(device, rng);
 }
@@ -368,6 +542,9 @@ int main(){
     test_pure_wind(device);
     test_center_of_pressure(device);
     test_roll_damping(device);
+    test_body_drag(device);
+    test_randomization(device);
+    test_motor_cut(device);
     test_same_as_l2f<float, false, whoop::Task::HOVER>(device, "float, hover, no-plate mass");
     test_same_as_l2f<float, true, whoop::Task::HOVER>(device, "float, hover, plate mass");
     test_same_as_l2f<double, true, whoop::Task::HOVER>(device, "double, hover, plate mass");

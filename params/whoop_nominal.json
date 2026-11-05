@@ -14,7 +14,9 @@
     "rotor_time_constant_rising": 0.04,
     "rotor_time_constant_falling": 0.08,
     "_J": "inertia [kg m^2], diagonal [assumption, scaled from the Crazyflie]",
-    "J": [[1.2e-05, 0, 0], [0, 1.2e-05, 0], [0, 0, 2.2e-05]]
+    "J": [[1.2e-05, 0, 0], [0, 1.2e-05, 0], [0, 0, 2.2e-05]],
+    "_body_drag": "linear drag of the bare whoop at the centre of mass, no torque: F = -diag(d) v_rel, v_rel the velocity relative to the air in the body frame [kg/s]; the truth of the synthetic flights in sysid/model.py (8 % of the weight at 3 m/s horizontally, less along z where the ducts are open) [assumption]",
+    "body_drag": [0.008, 0.008, 0.004]
   },
   "plate": {
     "_comment": "Vertical 3 mm EPP sheet under the frame, in the body x-z plane; model of research/flat_plate_aero.md section 1.5, Model B (saturating normal force) plus in-plane friction",
@@ -32,5 +34,10 @@
     "e0": 0.25,
     "downwash_factor": 0.0,
     "air_density": 1.2
+  },
+  "randomization": {
+    "_comment": "domain randomization of the aerodynamics in training, drawn once per episode: each coefficient is multiplied by its own factor from U(1 - r, 1 + r). plate: C_N90, K_px, K_pz, C_T and e0; body_drag: each of the three components [assumption: the coefficients are only priors until the plate is identified]",
+    "plate": 0.4,
+    "body_drag": 0.5
   }
 }
