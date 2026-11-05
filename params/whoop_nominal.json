@@ -1,0 +1,36 @@
+{
+  "_comment": "Nominal whoop and plate parameters shared by the simulator (sim/) and the identification tests (sysid/). Assumptions until the drone is weighed and identified: a 75 mm whoop of about 30 g (BetaFPV Meteor75 Pro class), L2F conventions (body x forward, y left, z up; thrust along +z; normalized motor command u in [0, 1]).",
+  "whoop": {
+    "mass": 0.030,
+    "gravity": [0, 0, -9.81],
+    "rotor_positions": [[0.0265, -0.0265, 0], [-0.0265, -0.0265, 0], [-0.0265, 0.0265, 0], [0.0265, 0.0265, 0]],
+    "rotor_thrust_directions": [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]],
+    "rotor_torque_directions": [[0, 0, -1], [0, 0, 1], [0, 0, -1], [0, 0, 1]],
+    "_thrust": "thrust per rotor [N] = c0 + c1 u + c2 u^2: about 0.3 N per rotor at full command, thrust-to-weight about 4 [assumption]",
+    "rotor_thrust_coefficients": [0.0, 0.03, 0.27],
+    "_torque": "yaw torque per rotor [N m] = rotor_torque_constant x thrust [assumption, Crazyflie order of magnitude]",
+    "rotor_torque_constant": 0.005,
+    "_time_constants": "first-order lag of the normalized motor state u, rising constant when the command is above the state, falling otherwise, as L2F (70_post_integration.h); thrust follows from the lagged u [s] [assumption]",
+    "rotor_time_constant_rising": 0.04,
+    "rotor_time_constant_falling": 0.08,
+    "_J": "inertia [kg m^2], diagonal [assumption, scaled from the Crazyflie]",
+    "J": [[1.2e-05, 0, 0], [0, 1.2e-05, 0], [0, 0, 2.2e-05]]
+  },
+  "plate": {
+    "_comment": "Vertical 3 mm EPP sheet under the frame, in the body x-z plane; model of research/flat_plate_aero.md section 1.5, Model B (saturating normal force) plus in-plane friction",
+    "_added_mass": "mass of the plate itself [kg]; with the plate the vehicle weighs mass + added_mass and the plate inertia is added to J",
+    "added_mass": 0.0007,
+    "chord_x": 0.12,
+    "height_z": 0.065,
+    "area": 0.0078,
+    "normal": [0, 1, 0],
+    "centroid": [0, 0, -0.04],
+    "CN90": 1.15,
+    "Kp_x": 0.84,
+    "Kp_z": 2.46,
+    "CT": 0.02,
+    "e0": 0.25,
+    "downwash_factor": 0.0,
+    "air_density": 1.2
+  }
+}

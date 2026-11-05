@@ -1,0 +1,3 @@
+# on the cluster the build and the runs live next to the sources (on a laptop, keep them outside the repository)
+build/
+runs/
